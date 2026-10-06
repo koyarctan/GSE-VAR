@@ -6,7 +6,7 @@ import torch
 
 pytest.importorskip("torch")
 
-from xneural_var import CMLP, CMLPTrainingConfig, construct_lagged_dataset, fit_cmlp
+from gse_var import CMLP, CMLPTrainingConfig, construct_lagged_dataset, fit_cmlp
 
 
 def test_vectorized_cmlp_forward_matches_target_networks():

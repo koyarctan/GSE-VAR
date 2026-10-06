@@ -3,13 +3,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from xneural_var import evaluate_jacobian_agreement
-from xneural_var.models import GVARWithNGCGates
+from gse_var import evaluate_jacobian_agreement
+from gse_var.models import GSEVAR
 
 
 def test_evaluate_jacobian_agreement_shapes_metrics_and_mode():
     torch.manual_seed(9)
-    model = GVARWithNGCGates(
+    model = GSEVAR(
         num_vars=3,
         order=2,
         hidden_layer_size=5,
@@ -40,7 +40,7 @@ def test_evaluate_jacobian_agreement_shapes_metrics_and_mode():
 
 
 def test_evaluate_jacobian_agreement_rejects_ungated_model():
-    model = GVARWithNGCGates(
+    model = GSEVAR(
         num_vars=2,
         order=1,
         hidden_layer_size=3,

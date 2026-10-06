@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from xneural_var.regularizers import (
+from gse_var.regularizers import (
     NGCRegularizer,
     group_lasso_penalty,
     hierarchical_group_lasso_penalty,
@@ -96,7 +96,7 @@ def test_hierarchical_prox_uses_oldest_lag_prefixes():
     gate = torch.zeros(3, 1, 1)
     gate[:, 0, 0] = torch.tensor([1.0, 1.0, 100.0])
 
-    from xneural_var.regularizers import prox_hierarchical_group_lasso_
+    from gse_var.regularizers import prox_hierarchical_group_lasso_
 
     prox_hierarchical_group_lasso_(gate, lam=2.0, step_size=1.0)
 

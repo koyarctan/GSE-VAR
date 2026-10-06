@@ -7,15 +7,19 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "xneural-var"
+name = "gse-var"
 version = "0.1.0"
-description = "Modular GVAR with Neural Granger Causality regularization."
+description = "GSE-VAR: Gated Self-Explaining Vector Autoregression with sparse Granger structure learning and exogenous inputs."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23",
     "torch>=2.0",
 ]
+
+
+[project.urls]
+Repository = "https://github.com/koyarctan/GSE-VAR"
 
 
 [project.optional-dependencies]
@@ -35,7 +39,7 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["xneural_var*"]
+include = ["gse_var*", "xneural_var*"]
 exclude = [
     "slides*",
     "figures*",

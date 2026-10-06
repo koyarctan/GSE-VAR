@@ -1,7 +1,9 @@
-# XNeural VAR
+# GSE-VAR
 
-Modular PyTorch implementation of a GVAR-style self-explaining neural
-autoregression with Neural Granger Causality (NGC) regularization.
+**Gated Self-Explaining Vector Autoregression** (GSE-VAR), with an
+exogenous-input extension, **GSE-VARX**. This modular PyTorch implementation
+combines state-dependent coefficients with gated Neural Granger Causality
+(NGC) regularization.
 
 This code is designed around two reference implementations:
 
@@ -32,11 +34,11 @@ pip install -e .[viz]
 ```python
 import numpy as np
 
-from xneural_var import GVARTrainingConfig, fit_gvar_ngc
+from gse_var import GSEVARTrainingConfig, fit_gse_var
 
 data = np.random.randn(300, 5).astype("float32")
 
-config = GVARTrainingConfig(
+config = GSEVARTrainingConfig(
     order=4,
     hidden_layer_size=32,
     num_hidden_layers=2,
@@ -52,7 +54,7 @@ config = GVARTrainingConfig(
     verbose=1,
 )
 
-result = fit_gvar_ngc(data, config)
+result = fit_gse_var(data, config)
 
 print(result.causal_strength)
 print(result.causal_graph)
@@ -148,7 +150,7 @@ Training logs are controlled by `verbose` and `log_every`.
 
 ## Coefficient--Jacobian Agreement
 
-XNeural-VAR's effective coefficient and the local prediction Jacobian are not
+GSE-VAR's effective coefficient and the local prediction Jacobian are not
 generally identical because the coefficient generator itself depends on the
 lagged input. For target `i`, source `j`, and lag `k`, the diagnostic compares
 
@@ -164,7 +166,7 @@ J_{t,k,i,j}
 Evaluate their agreement on lagged predictors as follows:
 
 ```python
-from xneural_var import (
+from gse_var import (
     construct_lagged_dataset,
     evaluate_jacobian_agreement,
 )
@@ -190,7 +192,7 @@ exact-zero paths from inflating the reported agreement.
 Agreement can optionally be encouraged during fitting:
 
 ```python
-config = GVARTrainingConfig(
+config = GSEVARTrainingConfig(
     order=4,
     hidden_layer_size=32,
     lambda_jacobian=1e-3,
@@ -223,14 +225,118 @@ coefficient generator must instead improve its local coefficient/Jacobian
 agreement. The public configuration remains unchanged: set
 `lambda_jacobian > 0` to enable this behavior.
 
+## GSE-VARX
+
+`GSEVARX` separates variables that are predicted from variables that are
+only used as predictors. The implementation is application-agnostic:
+
+- `endog` has shape `[time, p]` and contains any variables to predict;
+- `exog` has shape `[time, q]` and contains any aligned external predictors;
+- neither the number nor the names of variables are fixed by the model.
+
+For example, a marketing application may place brand-level quantities or
+sales in `endog` and prices, promotions, displays, holidays, or weather in
+`exog`, but these names have no special meaning in the code.
+
+```python
+from gse_var import (
+    GSEVARXTrainingConfig,
+    fit_gse_varx,
+)
+
+config = GSEVARXTrainingConfig(
+    order=5,                    # endogenous lags 5,...,1
+    exog_order=2,               # exogenous lags 2,1
+    include_current_exog=True,  # also include exogenous lag 0
+    hidden_layer_size=100,
+    max_epochs=2000,
+    batch_size=128,
+    learning_rate=1e-2,
+    regularizer="hierarchical_group_lasso",
+    lambda_ngc=1e-2,
+    lambda_ngc_exog=5e-3,
+    lambda_smooth=1e-2,
+    lambda_jacobian=10.0,
+    coefficient_weight_decay=1e-4,
+    optimizer="ista",
+    device="cuda",
+)
+
+result = fit_gse_varx(endog, exog, config)
+
+print(result.endogenous_graph)  # [endogenous target, endogenous source]
+print(result.exogenous_graph)   # [endogenous target, exogenous source]
+print(result.exogenous_lags)    # [2, 1, 0]
+```
+
+The returned coefficient arrays are:
+
+```python
+result.endogenous_coeffs.shape
+# [sample, order, endogenous_target, endogenous_source]
+
+result.exogenous_coeffs.shape
+# [sample, number_of_exogenous_terms, endogenous_target, exogenous_source]
+```
+
+`include_current_exog=True` is suitable when current external predictors are
+known at prediction time, such as a planned promotion or posted price. Set it
+to `False` to use only past external predictors; in that case `exog_order`
+must be at least one. `exog_order=0` with current exogenous inputs enabled uses
+only `exog[t]`.
+
+The endogenous and exogenous branches have separate coefficient generators,
+gates, strength maps, and graphs. Existing regularization fields configure the
+endogenous branch. The following optional fields override them for the
+exogenous branch; leaving one as `None` reuses the endogenous value:
+
+- `lambda_ngc_exog`
+- `lambda_smooth_exog`
+- `lambda_jacobian_exog`
+- `sparse_group_lambda_exog`
+- `sparse_l1_lambda_exog`
+- `exogenous_gate_init`
+
+Coefficient/Jacobian diagnostics are also reported separately:
+
+```python
+from gse_var import (
+    construct_varx_lagged_dataset,
+    evaluate_varx_jacobian_agreement,
+)
+
+lagged = construct_varx_lagged_dataset(
+    endog,
+    exog,
+    order=config.order,
+    exog_order=config.exog_order,
+    include_current_exog=config.include_current_exog,
+)
+agreement = evaluate_varx_jacobian_agreement(
+    result.model,
+    lagged.endogenous_predictors,
+    lagged.exogenous_predictors,
+)
+
+print(agreement.endogenous.relative_frobenius_error)
+print(agreement.exogenous.relative_frobenius_error)
+```
+
+As in GSE-VAR, Jacobian penalties hold the corresponding gates fixed and
+update only their coefficient generators. If contemporaneous exogenous inputs
+are included, `exogenous_graph` represents selected conditional predictive
+effects, not automatically identified intervention effects. In particular,
+prices must satisfy the assumed exogeneity or be handled with an appropriate
+identification strategy before interpreting coefficients causally.
+
 ## Visualization
 
-The visualization utilities are intended for the XNeural VAR result returned by
-`fit_gvar_ngc`. They use the learned `causal_gate` and the gated effective
+The visualization utilities are intended for the GSE-VAR result returned by
+`fit_gse_var`. They use the learned `causal_gate` and the gated effective
 coefficient tensor `result.coeffs`.
 
 ```python
-from xneural_var import plot_causal_gate_by_lag, plot_edge_lag_boxplots
+from gse_var import plot_causal_gate_by_lag, plot_edge_lag_boxplots
 
 variable_names = [f"x{i}" for i in range(data.shape[1])]
 
@@ -284,8 +390,8 @@ For validation experiments, the package also exposes reference-style cMLP and
 GVAR baselines with the same high-level fit-result interface:
 
 ```python
-from xneural_var import CMLPTrainingConfig, GVARBaselineTrainingConfig
-from xneural_var import fit_cmlp, fit_gvar
+from gse_var import CMLPTrainingConfig, GVARBaselineTrainingConfig
+from gse_var import fit_cmlp, fit_gvar
 
 cmlp_result = fit_cmlp(
     data,
@@ -313,7 +419,7 @@ gvar_result = fit_gvar(
 `fit_cmlp` follows the Neural-GC component-wise MLP design: one MLP is trained
 per target variable, and Granger structure is read from the first-layer input
 weights. Its sparse group lasso uses direct `sparse_group_lambda` and
-`sparse_l1_lambda` parameters, matching the XNeural VAR convention.
+`sparse_l1_lambda` parameters, matching the GSE-VAR convention.
 
 `fit_gvar` disables the NGC causal gate and trains the GVAR/SENN-style
 state-dependent coefficient model directly. Because this baseline has no
@@ -326,21 +432,54 @@ rather than exact structural zeros.
 
 `fit_gvar` is a pure GVAR/SENN-style model that does not use causal gates. Since this model does not produce exact zeros through proximal gradient updates, `causal_graph` should be interpreted as a comparison graph obtained by thresholding coefficient magnitudes with `causal_threshold`.
 
+## Migration from XNeural VAR
+
+The project and distribution are now named `GSE-VAR` and `gse-var`; the
+canonical Python package is `gse_var`. Model behavior, configuration fields,
+and state-dict parameter names are unchanged.
+
+| Previous name | Canonical name |
+| --- | --- |
+| `xneural_var` | `gse_var` |
+| `GVARWithNGCGates` | `GSEVAR` |
+| `GVARTrainingConfig` | `GSEVARTrainingConfig` |
+| `FitResult` | `GSEVARFitResult` |
+| `fit_gvar_ngc` | `fit_gse_var` |
+| `XNeuralVARX` | `GSEVARX` |
+| `XNeuralVARXTrainingConfig` | `GSEVARXTrainingConfig` |
+| `XNeuralVARXFitResult` | `GSEVARXFitResult` |
+| `XNeuralVARXJacobianAgreementResult` | `GSEVARXJacobianAgreementResult` |
+| `fit_xneural_varx` | `fit_gse_varx` |
+
+Legacy package imports, submodule imports, and API names remain available as
+compatibility aliases. Existing experiments do not need to change immediately;
+new code and examples use the canonical names. The comparison baseline
+`GVARBaselineTrainingConfig` / `fit_gvar` keeps its original name because it
+implements the original GVAR method rather than GSE-VAR.
+
+After updating the checkout, refresh an editable installation with
+`pip install --no-deps -e .`. If the old `xneural-var` distribution was
+installed separately, uninstall that distribution first to avoid duplicate
+editable-install metadata; the new `gse-var` distribution also supplies the
+compatibility package.
+
 ## Package Layout
 
-- `xneural_var.models`: GVAR/SENN model with causal gates.
-- `xneural_var.gvar`: GVAR baseline without NGC causal gates.
-- `xneural_var.cmlp`: Neural-GC cMLP baseline.
-- `xneural_var.regularizers`: sparse group lasso, hierarchical group lasso, and
+- `gse_var.models`: GSE-VAR and GSE-VARX coefficient models with causal gates.
+- `gse_var.gvar`: GVAR baseline without NGC causal gates.
+- `gse_var.cmlp`: Neural-GC cMLP baseline.
+- `gse_var.regularizers`: sparse group lasso, hierarchical group lasso, and
   proximal operators.
-- `xneural_var.training`: training loop, logging, and result objects.
-- `xneural_var.visualization`: XNeural VAR causal-gate and effective-coefficient
+- `gse_var.training`: GSE-VAR training loop, logging, and result objects.
+- `gse_var.varx`: GSE-VARX training and result objects.
+- `gse_var.interpretability`: coefficient/Jacobian agreement diagnostics.
+- `gse_var.visualization`: GSE-VAR causal-gate and effective-coefficient
   plots.
-- `xneural_var.data`: lagged dataset construction.
+- `gse_var.data`: lagged dataset construction.
 
 ---
 
-## アルゴリズム: self-eXplaining neural VAR
+## アルゴリズム: GSE-VAR — Gated Self-Explaining Vector Autoregression
 
 この節では、本実装の考え方を説明する。
 本手法は、GVAR の「状態依存的で符号解釈可能な係数行列」と、Neural Granger Causality (NGC) の「構造的スパース性」を、学習可能な `causal_gate` により統合する。

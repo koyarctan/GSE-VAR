@@ -4,11 +4,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from xneural_var.models import GVARWithNGCGates
+from gse_var.models import GSEVAR
 
 
-def test_vectorized_gvar_forward_shapes_and_gradients():
-    model = GVARWithNGCGates(
+def test_vectorized_gse_var_forward_shapes_and_gradients():
+    model = GSEVAR(
         num_vars=3,
         order=2,
         hidden_layer_size=5,
@@ -27,7 +27,7 @@ def test_vectorized_gvar_forward_shapes_and_gradients():
 
 def test_fast_jacobian_matches_explicit_autograd():
     torch.manual_seed(7)
-    model = GVARWithNGCGates(
+    model = GSEVAR(
         num_vars=3,
         order=2,
         hidden_layer_size=5,
@@ -61,7 +61,7 @@ def test_fast_jacobian_matches_explicit_autograd():
 
 def test_fast_jacobian_penalty_gradient_matches_explicit_autograd():
     torch.manual_seed(8)
-    fast_model = GVARWithNGCGates(
+    fast_model = GSEVAR(
         num_vars=2,
         order=2,
         hidden_layer_size=4,
@@ -115,7 +115,7 @@ def test_fast_jacobian_penalty_gradient_matches_explicit_autograd():
 
 def test_regularization_mismatch_stops_only_causal_gate_gradient():
     torch.manual_seed(10)
-    model = GVARWithNGCGates(
+    model = GSEVAR(
         num_vars=2,
         order=2,
         hidden_layer_size=4,

@@ -3,7 +3,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from xneural_var import GVARBaselineTrainingConfig, fit_gvar
+from gse_var import GVARBaselineTrainingConfig, fit_gvar
 
 
 def test_fit_gvar_baseline_smoke():
