@@ -432,37 +432,6 @@ rather than exact structural zeros.
 
 `fit_gvar` is a pure GVAR/SENN-style model that does not use causal gates. Since this model does not produce exact zeros through proximal gradient updates, `causal_graph` should be interpreted as a comparison graph obtained by thresholding coefficient magnitudes with `causal_threshold`.
 
-## Migration from XNeural VAR
-
-The project and distribution are now named `GSE-VAR` and `gse-var`; the
-canonical Python package is `gse_var`. Model behavior, configuration fields,
-and state-dict parameter names are unchanged.
-
-| Previous name | Canonical name |
-| --- | --- |
-| `xneural_var` | `gse_var` |
-| `GVARWithNGCGates` | `GSEVAR` |
-| `GVARTrainingConfig` | `GSEVARTrainingConfig` |
-| `FitResult` | `GSEVARFitResult` |
-| `fit_gvar_ngc` | `fit_gse_var` |
-| `XNeuralVARX` | `GSEVARX` |
-| `XNeuralVARXTrainingConfig` | `GSEVARXTrainingConfig` |
-| `XNeuralVARXFitResult` | `GSEVARXFitResult` |
-| `XNeuralVARXJacobianAgreementResult` | `GSEVARXJacobianAgreementResult` |
-| `fit_xneural_varx` | `fit_gse_varx` |
-
-Legacy package imports, submodule imports, and API names remain available as
-compatibility aliases. Existing experiments do not need to change immediately;
-new code and examples use the canonical names. The comparison baseline
-`GVARBaselineTrainingConfig` / `fit_gvar` keeps its original name because it
-implements the original GVAR method rather than GSE-VAR.
-
-After updating the checkout, refresh an editable installation with
-`pip install --no-deps -e .`. If the old `xneural-var` distribution was
-installed separately, uninstall that distribution first to avoid duplicate
-editable-install metadata; the new `gse-var` distribution also supplies the
-compatibility package.
-
 ## Package Layout
 
 - `gse_var.models`: GSE-VAR and GSE-VARX coefficient models with causal gates.
