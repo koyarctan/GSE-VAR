@@ -468,9 +468,3 @@ def fit_gse_var(
         causal_strength=strength,
         causal_graph=graph,
     )
-
-
-# Compatibility aliases; new code should use the GSE-VAR names above.
-GVARTrainingConfig = GSEVARTrainingConfig
-FitResult = GSEVARFitResult
-fit_gvar_ngc = fit_gse_var

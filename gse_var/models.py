@@ -742,8 +742,3 @@ class GSEVARX(nn.Module):
             coefficients,
             aggregation=aggregation,
         )
-
-
-# Legacy aliases also support loading previously pickled full models.
-GVARWithNGCGates = GSEVAR
-XNeuralVARX = GSEVARX

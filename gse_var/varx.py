@@ -587,9 +587,3 @@ def fit_gse_varx(
         exogenous_graph=exogenous_graph,
         exogenous_lags=dataset_np.exogenous_lags.copy(),
     )
-
-
-# Compatibility aliases for experiments written before the project rename.
-XNeuralVARXTrainingConfig = GSEVARXTrainingConfig
-XNeuralVARXFitResult = GSEVARXFitResult
-fit_xneural_varx = fit_gse_varx

@@ -287,7 +287,3 @@ def evaluate_varx_jacobian_agreement(
         endogenous=endogenous_result,
         exogenous=exogenous_result,
     )
-
-
-# Legacy diagnostic result name for saved objects and older imports.
-XNeuralVARXJacobianAgreementResult = GSEVARXJacobianAgreementResult

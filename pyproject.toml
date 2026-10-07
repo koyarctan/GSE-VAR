@@ -39,7 +39,7 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["gse_var*", "xneural_var*"]
+include = ["gse_var*"]
 exclude = [
     "slides*",
     "figures*",

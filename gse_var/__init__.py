@@ -103,29 +103,15 @@ _LAZY_ATTRS = {
     "sparse_group_lasso_penalty": ("gse_var.regularizers", "sparse_group_lasso_penalty"),
 }
 
-# Compatibility aliases for pre-GSE-VAR experiments and saved objects.
-_LEGACY_ATTRS = {
-    "FitResult": "GSEVARFitResult",
-    "GVARTrainingConfig": "GSEVARTrainingConfig",
-    "GVARWithNGCGates": "GSEVAR",
-    "XNeuralVARX": "GSEVARX",
-    "XNeuralVARXFitResult": "GSEVARXFitResult",
-    "XNeuralVARXJacobianAgreementResult": "GSEVARXJacobianAgreementResult",
-    "XNeuralVARXTrainingConfig": "GSEVARXTrainingConfig",
-    "fit_gvar_ngc": "fit_gse_var",
-    "fit_xneural_varx": "fit_gse_varx",
-}
-
 
 def __getattr__(name: str):
-    canonical_name = _LEGACY_ATTRS.get(name, name)
-    if canonical_name not in _LAZY_ATTRS:
+    if name not in _LAZY_ATTRS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name, attr_name = _LAZY_ATTRS[canonical_name]
+    module_name, attr_name = _LAZY_ATTRS[name]
     value = getattr(import_module(module_name), attr_name)
     globals()[name] = value
     return value
 
 
 def __dir__():
-    return sorted(set(globals()) | set(__all__) | set(_LEGACY_ATTRS))
+    return sorted(set(globals()) | set(__all__))
