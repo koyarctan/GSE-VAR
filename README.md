@@ -329,9 +329,151 @@ effects, not automatically identified intervention effects. In particular,
 prices must satisfy the assumed exogeneity or be handled with an appropriate
 identification strategy before interpreting coefficients causally.
 
+### Variable-specific exogenous lags and source-level selection
+
+For different lag sets, keep original source/lag identities rather than
+interpreting every expanded column as an unrelated variable. The coefficient
+generator still receives only valid packed features; no padded variables or
+extra gates are learned. There are two input routes:
+
+1. Raw `exog` columns plus `exog_names` and a complete `exog_lags` mapping.
+2. Already expanded columns plus an ordered `ExogenousLayout` of
+   `ExogenousFeature` objects, one per input column. **Do not shift them again.**
+
+Both routes require `exog_order=0, include_current_exog=True` to describe the
+packed representation. Actual physical offsets live in the layout. Positive
+lag `l` means `x[t-l]`, zero means current, and negative means a lead. Leads
+must be explicitly declared known at prediction time; this does not establish
+statistical exogeneity. Preprocessing/scaling must be fitted on training data
+and reused unchanged for validation/test.
+
+```python
+from gse_var import GSEVARXTrainingConfig, fit_gse_varx
+
+config = GSEVARXTrainingConfig(
+    order=5, hidden_layer_size=100,
+    exog_order=0, include_current_exog=True,
+    regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
+    regularizer_exog="sparse_group_lasso", lambda_ngc_exog=0.0,
+    sparse_group_lambda_exog=0.01, sparse_l1_lambda_exog=0.005,
+    coefficient_weight_decay=1e-4, optimizer="ista", causal_threshold=0,
+)
+result = fit_gse_varx(
+    endog_train, exog_train, config,
+    exog_names=["promo", "oil", "payday", "holiday"],
+    exog_lags={"promo": [0, 1, 2, 3, 4], "oil": [1, 2, 3, 4, 5],
+               "payday": [-2, -1, 0, 1, 2], "holiday": [0]},
+    known_future_exog=["payday"],
+)
+```
+
+The weights above are examples, not validated hyperparameters. Each target
+and original source forms its own gate group across **valid** lags. Sparse
+group lasso combines source-level and individual-lag selection. Calendar
+sources receive the same gate regularization as other sources. By default,
+the group term is weighted by `sqrt(number of valid lags)`; set
+`exogenous_group_size_weights=False` for unweighted groups. The nonnegative
+proximal update retains exact zeros with ISTA. Jacobian penalties continue to
+hold both gates fixed. Hierarchical exogenous penalties reject layouts with
+leads: a one-sided lag hierarchy should not silently impose an order on
+future and past calendar effects.
+
+Raw lead construction requires enough future known-ahead rows. It trims final
+responses if those rows are unavailable. Extra trailing `exog` rows are
+allowed in this mode; unrelated unused future cells may be NaN. Blocks are
+never crossed. For existing expanded data, alignment is already done by the
+preprocessing code, so no additional trimming for physical leads is performed.
+
+For the previously prepared Favorita data (`exog_train` has 150 columns), use
+its existing metadata **in the same column order**, without rebuilding CSVs:
+
+```python
+from gse_var import ExogenousFeature, ExogenousLayout
+
+info = prepared["feature_info"].loc[prepared["exog_names"]]
+features = ExogenousLayout(tuple(
+    ExogenousFeature(
+        source=str(row.source), lag=int(row.lag), kind=row.kind,
+        known_ahead=(row.kind == "payday"),  # these leads are known calendar dates
+    )
+    for row in info.itertuples()
+))
+result = fit_gse_varx(
+    prepared["train"]["endog"], prepared["train"]["exog"], config,
+    exog_features=features, endog_names=prepared["endog_names_ja"],
+)
+```
+
+`ExogenousFeature.label` optionally sets the original source's display name;
+use the same label at every lag, not a label containing a lag suffix.
+
+In layout-aware mode, `result.exogenous_coeffs` retains packed shape
+`[sample, 1, target, feature]`, while `exogenous_graph` and
+`exogenous_strength` are `[target, original_source]`. Source ordering is
+`result.exogenous_source_names`; physical lag ordering is
+`result.exogenous_lags`. `result.exogenous_gate_by_lag` and
+`result.exogenous_graph_by_lag` have `[lag, target, original_source]` shape,
+with NaN for unrequested combinations. `exogenous_term_graph` retains the
+individual packed feature decisions. `exogenous_coeffs_by_lag` exposes the
+corresponding dense coefficient view `[sample, lag, target, original_source]`.
+Binary graph aggregation uses the L2
+norm over valid gates **before** applying the threshold, not signed coefficient
+sums or OR of individually thresholded lags. Those methods coincide only in
+the appropriate zero-threshold case. Legacy uniform-lag results are unchanged.
+
+### VARX visualization and input-specific coefficient distributions
+
+The existing plot functions now support `branch="endogenous"` or
+`branch="exogenous"`, different target/source counts, and physical leads,
+current inputs and variable-specific lags. Gray cells/spans mean **not
+requested**, not estimated zero. Gate plots are continuous by default for
+compatibility; use `binary=True` for lag-wise 0/1 matrices.
+
+```python
+from gse_var import (
+    construct_varx_lagged_dataset, causal_gate_matrices,
+    plot_causal_gate_by_lag, plot_causal_graph_matrix,
+    plot_edge_lag_boxplots, plot_edge_lag_forest,
+)
+
+valid_inputs = construct_varx_lagged_dataset(
+    prepared["valid"]["endog"], prepared["valid"]["exog"],
+    order=config.order, exog_features=features,
+)
+
+plot_causal_gate_by_lag(result, branch="exogenous", binary=True)
+plot_causal_graph_matrix(result, branch="exogenous")
+matrices = causal_gate_matrices(result, branch="exogenous")
+print(matrices.by_lag, matrices.aggregated)
+
+# Evaluate only the passed predictors. Neither validation responses nor the
+# training coefficient cache are used; model weights are not updated.
+plot_edge_lag_boxplots(result, branch="exogenous", data=valid_inputs, top_n=6)
+plot_edge_lag_forest(result, valid_inputs, branch="exogenous",
+                     dataset_label="valid", quantiles=(0.05, 0.95), top_n=6)
+plot_edge_lag_forest(result, valid_inputs, branch="endogenous",
+                     dataset_label="valid", edges=[(0, 1)])
+```
+
+Repeat with train/test inputs to display their corresponding coefficient
+distributions. Forest dots are period means (or `center="median"`), and bars
+are empirical quantiles over the provided inputs, **not confidence intervals**.
+The forest function requires explicit input data and never falls back to the
+training cache. `evaluate_coefficients(result, valid_inputs)` also exposes
+these evaluated coefficient arrays without plotting or refitting. Arrays must
+use the same training-fitted scales and feature order. Display values are on
+the fitted input/output scales, not automatically intervention effects or
+original-unit sales effects.
+
+An exogenous graph containing lag 0 or known-ahead leads is labeled an input
+dependency graph, not automatically Granger causality. Set `lag_scope="past"`
+in `causal_gate_matrices` or `plot_causal_graph_matrix` to restrict aggregation
+to positive lags; sources with no past inputs appear as unused. For a VARX
+exogenous plot, use `target_names` and `source_names` for separate labels.
+
 ## Visualization
 
-The visualization utilities are intended for the GSE-VAR result returned by
+The original visualization calls below apply to the GSE-VAR result returned by
 `fit_gse_var`. They use the learned `causal_gate` and the gated effective
 coefficient tensor `result.coeffs`.
 

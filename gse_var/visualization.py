@@ -3,8 +3,11 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 from typing import Any, Literal
+from dataclasses import dataclass
 
 import numpy as np
+
+from .prediction import evaluate_coefficients
 
 GateSummaryName = Literal["norm", "max", "mean"]
 BoxplotValueName = Literal["signed", "absolute"]
@@ -80,13 +83,16 @@ def _lag_titles(order: int) -> list[str]:
 
 
 def _summary_gate(gate: np.ndarray, summary: GateSummaryName) -> np.ndarray:
+    valid = np.isfinite(gate).any(axis=0)
     if summary == "norm":
-        return np.linalg.norm(gate, axis=0)
-    if summary == "max":
-        return np.max(gate, axis=0)
-    if summary == "mean":
-        return np.mean(gate, axis=0)
-    raise ValueError(f"unsupported gate summary: {summary}")
+        result = np.sqrt(np.nansum(gate ** 2, axis=0))
+    elif summary == "max":
+        result = np.max(np.where(np.isfinite(gate), gate, -np.inf), axis=0)
+    elif summary == "mean":
+        result = np.nansum(gate, axis=0) / np.maximum(np.isfinite(gate).sum(axis=0), 1)
+    else:
+        raise ValueError(f"unsupported gate summary: {summary}")
+    return np.where(valid, result, np.nan)
 
 
 def _heatmap_limits(mats: list[np.ndarray], percentile: float) -> tuple[float, float]:
@@ -103,13 +109,13 @@ def _auto_tick_label_step(n_names: int) -> int:
     return max(1, ceil(n_names / 12))
 
 
-def _format_ticks(ax: Any, names: list[str], label_step: int) -> None:
-    positions = np.arange(len(names))
-    ax.set_xticks(positions)
-    ax.set_yticks(positions)
-    visible_names = [name if idx % label_step == 0 else "" for idx, name in enumerate(names)]
-    ax.set_xticklabels(visible_names, rotation=45, ha="right", rotation_mode="anchor")
-    ax.set_yticklabels(visible_names)
+def _format_ticks(ax: Any, names: list[str], label_step: int, source_names=None) -> None:
+    sources = names if source_names is None else source_names
+    ax.set_xticks(np.arange(len(sources)))
+    ax.set_yticks(np.arange(len(names)))
+    ax.set_xticklabels([n if i % label_step == 0 else "" for i, n in enumerate(sources)],
+                       rotation=45, ha="right", rotation_mode="anchor")
+    ax.set_yticklabels([n if i % label_step == 0 else "" for i, n in enumerate(names)])
     ax.set_xlabel("source")
     ax.set_ylabel("target")
 
@@ -117,6 +123,8 @@ def _format_ticks(ax: Any, names: list[str], label_step: int) -> None:
 def _annotate_heatmap(ax: Any, mat: np.ndarray, fmt: str) -> None:
     for row in range(mat.shape[0]):
         for col in range(mat.shape[1]):
+            if not np.isfinite(mat[row, col]):
+                continue
             ax.text(
                 col,
                 row,
@@ -139,6 +147,11 @@ def plot_causal_gate_by_lag(
     result_or_model: Any,
     *,
     variable_names: list[str] | tuple[str, ...] | None = None,
+    branch: str = "endogenous",
+    target_names=None,
+    source_names=None,
+    binary: bool = False,
+    threshold: float | None = None,
     include_summary: bool = True,
     summary: GateSummaryName = "norm",
     percentile: float = 99.0,
@@ -153,7 +166,11 @@ def plot_causal_gate_by_lag(
     dpi: int = 300,
     show: bool = True,
 ) -> tuple[Any, Any]:
-    """Plot one causal-gate heatmap per lag for GSE-VAR.
+    """Plot causal gates or binary edge matrices for GSE-VAR/GSE-VARX.
+
+    VARX uses branch='endogenous'/'exogenous'. Layout-aware exogenous views
+    retain actual lag/current/lead numbers, original sources, and NaN holes.
+    binary=True thresholds each lag and the aggregated L2 gate separately.
 
     Parameters
     ----------
@@ -166,21 +183,23 @@ def plot_causal_gate_by_lag(
         Summary used for the final panel: ``"norm"``, ``"max"``, or ``"mean"``.
     """
     plt = _require_matplotlib()
-    gate = _get_gate(result_or_model)
+    gate, lags, names, sources = _branch_gate(result_or_model, branch, variable_names,
+                                            target_names, source_names)
     order, n_targets, n_sources = gate.shape
-    if n_targets != n_sources:
-        raise ValueError("causal_gate must be square in target/source dimensions.")
-
-    names = _resolve_variable_names(n_targets, variable_names)
-    mats = [gate[lag_idx] for lag_idx in range(order)]
-    titles = _lag_titles(order)
+    threshold = _threshold(result_or_model, threshold)
+    if binary and include_summary and summary != "norm":
+        raise ValueError("binary graph summaries use lag-direction L2 norms")
+    mats = [_binary_gate(gate[k], threshold) if binary else gate[k] for k in range(order)]
+    titles = [_lag_title(lag) for lag in lags]
     if include_summary:
         summary_mat = _summary_gate(gate, summary)
-        mats.append(summary_mat)
-        titles.append(f"{summary} summary")
+        mats.append(_binary_gate(summary_mat, threshold) if binary else summary_mat)
+        titles.append("Aggregated graph" if binary else f"{summary} summary")
 
     vmin, vmax = _heatmap_limits(mats, percentile=percentile)
-    cmap = cmap or "viridis"
+    if binary:
+        vmin, vmax = 0.0, 1.0
+    cmap = plt.get_cmap(cmap or "viridis").with_extremes(bad="#BDBDBD")
 
     n_panels = len(mats)
     if ncols is None:
@@ -221,7 +240,7 @@ def plot_causal_gate_by_lag(
                 aspect="equal",
             )
             ax.set_title(panel_title, fontsize=10, fontweight="semibold")
-            _format_ticks(ax, names, label_step=tick_label_step)
+            _format_ticks(ax, names, label_step=tick_label_step, source_names=sources)
             ax.set_xticks(np.arange(-0.5, n_sources, 1), minor=True)
             ax.set_yticks(np.arange(-0.5, n_targets, 1), minor=True)
             ax.grid(which="minor", color="white", linewidth=0.8)
@@ -238,10 +257,189 @@ def plot_causal_gate_by_lag(
         if image is not None:
             cax = fig.add_subplot(grid[:, -1])
             cbar = fig.colorbar(image, cax=cax)
-            cbar.set_label("gate", rotation=270, labelpad=14)
+            cbar.set_label("edge (0/1)" if binary else "gate", rotation=270, labelpad=14)
+            if binary:
+                cbar.set_ticks([0, 1])
 
         _finish_figure(fig, save_path, dpi=dpi, show=show)
         return fig, axes
+
+
+def _threshold(result_or_model, threshold):
+    value = getattr(result_or_model, "causal_threshold", 0.0) if threshold is None else threshold
+    if not np.isfinite(value) or value < 0:
+        raise ValueError("threshold must be finite and nonnegative")
+    return float(value)
+
+
+def _binary_gate(gate, threshold):
+    return np.where(np.isfinite(gate), (gate > threshold).astype(float), np.nan)
+
+
+def _lag_title(lag):
+    return f"lead {-lag}" if lag < 0 else ("current" if lag == 0 else f"lag {lag}")
+
+
+def _branch_gate(result_or_model, branch, variable_names=None, target_names=None, source_names=None):
+    if branch not in ("endogenous", "exogenous"):
+        raise ValueError("branch must be 'endogenous' or 'exogenous'")
+    model = _get_model(result_or_model)
+    if hasattr(model, "endogenous_gate"):
+        gate = _to_numpy(getattr(model, f"{branch}_gate"))
+        if not np.isfinite(gate).all() or (gate < 0).any():
+            raise ValueError("model gates must be finite and nonnegative")
+        if branch == "exogenous" and model.exogenous_layout is not None:
+            layout = model.exogenous_layout
+            gate = layout.gate_by_lag(gate)
+            lags, default_sources = layout.lags, layout.labels
+        elif branch == "exogenous":
+            lags = np.arange(model.exog_order, -1 if model.include_current_exog else 0, -1)
+            default_sources = None
+        else:
+            lags, default_sources = np.arange(model.order, 0, -1), None
+        default_targets = getattr(result_or_model, "endogenous_names", None)
+    else:
+        if branch == "exogenous":
+            raise ValueError("exogenous plots require a GSE-VARX model")
+        gate = _get_gate(result_or_model)
+        if not np.isfinite(gate).all():
+            raise ValueError("model gates must be finite")
+        lags, default_sources, default_targets = np.arange(gate.shape[0], 0, -1), None, None
+    if np.any(gate[np.isfinite(gate)] < 0) or np.isinf(gate).any():
+        raise ValueError("gates must be finite and nonnegative at valid source/lag slots")
+    targets = _resolve_variable_names(gate.shape[1], target_names if target_names is not None
+                                      else variable_names if variable_names is not None else default_targets)
+    sources = _resolve_variable_names(gate.shape[2], source_names if source_names is not None
+                                      else variable_names if variable_names is not None
+                                      else targets if branch == "endogenous" else default_sources)
+    return gate, lags, targets, sources
+
+
+def _branch_coeffs(result_or_model, branch, data=None, exog_inputs=None, batch_size=256):
+    obj = (evaluate_coefficients(result_or_model, data, exog_inputs=exog_inputs, batch_size=batch_size)
+           if data is not None else result_or_model)
+    model = _get_model(obj)
+    if hasattr(model, "endogenous_gate"):
+        raw = getattr(obj, f"{branch}_coeffs", None)
+        if raw is None:
+            raise ValueError("provide data to evaluate coefficients for this branch")
+        coefficients = _to_numpy(raw)
+        if branch == "exogenous" and model.exogenous_layout is not None:
+            coefficients = model.exogenous_layout.coefficients_by_lag(coefficients)
+    else:
+        coefficients = _get_coeffs(obj)
+    if coefficients.ndim != 4 or coefficients.shape[0] == 0:
+        raise ValueError("coefficients must be nonempty [sample, lag, target, source]")
+    return coefficients
+
+
+@dataclass(frozen=True)
+class CausalGateMatrices:
+    lags: np.ndarray
+    by_lag: np.ndarray
+    aggregated: np.ndarray
+    target_names: tuple[str, ...]
+    source_names: tuple[str, ...]
+
+
+def causal_gate_matrices(result_or_model, *, branch="endogenous", threshold=None,
+                         lag_scope="all", variable_names=None, target_names=None, source_names=None):
+    """Binary lag views and aggregate-then-threshold L2 graph; NaN = unused.
+
+    ``lag_scope='past'`` excludes current/lead inputs. An all-input exogenous
+    graph is a predictive dependency graph, not a Granger significance test.
+    """
+    gate, lags, targets, sources = _branch_gate(result_or_model, branch, variable_names,
+                                              target_names, source_names)
+    if lag_scope not in ("all", "past"):
+        raise ValueError("lag_scope must be 'all' or 'past'")
+    if lag_scope == "past":
+        gate, lags = gate[lags > 0], lags[lags > 0]
+    value = _threshold(result_or_model, threshold)
+    return CausalGateMatrices(lags=lags.copy(), by_lag=_binary_gate(gate, value),
+                             aggregated=_binary_gate(_summary_gate(gate, "norm"), value),
+                             target_names=tuple(targets), source_names=tuple(sources))
+
+
+def plot_causal_graph_matrix(result_or_model, *, branch="endogenous", threshold=None,
+                             lag_scope="all", variable_names=None, target_names=None,
+                             source_names=None, title=None, figsize=None, annotate=None,
+                             tick_label_step=1, cmap="viridis", save_path=None, dpi=300, show=True):
+    """Plot the lag-aggregated binary graph separately from lag panels."""
+    plt = _require_matplotlib()
+    matrices = causal_gate_matrices(result_or_model, branch=branch, threshold=threshold,
+                                    lag_scope=lag_scope, variable_names=variable_names,
+                                    target_names=target_names, source_names=source_names)
+    mat = matrices.aggregated
+    if figsize is None:
+        figsize = (max(5, 0.25 * mat.shape[1] + 2), max(4, 0.23 * mat.shape[0] + 1))
+    if annotate is None:
+        annotate = max(mat.shape) <= 8
+    color_map = plt.get_cmap(cmap).with_extremes(bad="#BDBDBD")
+    with plt.rc_context(_PAPER_RC):
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        im = ax.imshow(mat, vmin=0, vmax=1, cmap=color_map, interpolation="nearest", aspect="auto")
+        _format_ticks(ax, list(matrices.target_names), max(1, int(tick_label_step)),
+                      source_names=list(matrices.source_names))
+        if annotate:
+            _annotate_heatmap(ax, mat, ".0f")
+        ax.set_title(title or ("Aggregated endogenous Granger structure" if branch == "endogenous"
+                              else "Aggregated exogenous input dependencies"))
+        fig.colorbar(im, ax=ax, ticks=[0, 1], label="edge (0/1)")
+        _finish_figure(fig, save_path, dpi, show)
+        return fig, ax
+
+
+def plot_edge_lag_forest(result_or_model, data, *, branch="endogenous", exog_inputs=None,
+                          edges=None, top_n=6, exclude_self=True, variable_names=None,
+                          target_names=None, source_names=None, quantiles=(0.05, 0.95),
+                          center="mean", dataset_label="Provided inputs", batch_size=256,
+                          title=None, figsize=None, save_path=None, dpi=300, show=True):
+    """Forest plot of effective coefficients evaluated on supplied inputs ONLY.
+
+    Dots are period means/medians; bars are within-input empirical quantiles,
+    NOT confidence intervals. No training coefficients, responses or bootstrap
+    estimates are used. Every displayed row is a valid (target, source, lag).
+    """
+    if data is None:
+        raise ValueError("forest plots require explicit input data")
+    if center not in ("mean", "median"):
+        raise ValueError("center must be 'mean' or 'median'")
+    if len(quantiles) != 2 or not (0 <= quantiles[0] < quantiles[1] <= 1):
+        raise ValueError("quantiles must satisfy 0 <= lower < upper <= 1")
+    coeffs = _branch_coeffs(result_or_model, branch, data, exog_inputs, batch_size)
+    _, lags, targets, sources = _branch_gate(result_or_model, branch, variable_names,
+                                            target_names, source_names)
+    selected = _select_edges(None, coeffs, edges, top_n, exclude_self and branch == "endogenous")
+    rows = []
+    for target, source in selected:
+        for k, lag in enumerate(lags):
+            values = coeffs[:, k, target, source]
+            values = values[np.isfinite(values)]
+            if not len(values):
+                continue
+            low, high = np.quantile(values, quantiles)
+            point = np.mean(values) if center == "mean" else np.median(values)
+            label = f"{_edge_label(target, source, targets, sources)} | {_lag_title(lag)}"
+            rows.append((label, float(point), float(low), float(high)))
+    if not rows:
+        raise ValueError("no valid edge/lag rows selected")
+    plt = _require_matplotlib()
+    with plt.rc_context(_PAPER_RC):
+        fig, ax = plt.subplots(figsize=figsize or (8, max(3, 0.3 * len(rows) + 1.5)),
+                               constrained_layout=True)
+        positions = np.arange(len(rows))
+        ax.hlines(positions, [r[2] for r in rows], [r[3] for r in rows], color="#4C78A8", linewidth=1.5)
+        ax.scatter([r[1] for r in rows], positions, color="#4C78A8", s=22, zorder=3)
+        ax.axvline(0, color="#555555", linestyle="--", linewidth=0.8)
+        ax.set_yticks(positions, [r[0] for r in rows])
+        ax.invert_yaxis()
+        ax.set_xlabel("effective coefficient (fitted input/output scales)")
+        ax.set_title(title or f"{dataset_label}: {center} and {100 * quantiles[0]:g}–{100 * quantiles[1]:g}% "
+                     f"within-input range (not CI), n={coeffs.shape[0]}")
+        ax.spines[["top", "right"]].set_visible(False)
+        _finish_figure(fig, save_path, dpi, show)
+        return fig, ax
 
 
 def _strength_from_result_or_coeffs(result: Any, coeffs: np.ndarray) -> np.ndarray:
@@ -250,7 +448,7 @@ def _strength_from_result_or_coeffs(result: Any, coeffs: np.ndarray) -> np.ndarr
         strength_np = _to_numpy(strength)
         if strength_np.shape == coeffs.shape[2:]:
             return strength_np
-    return np.quantile(np.abs(coeffs), 0.95, axis=(0, 1))
+    return np.nanquantile(np.abs(coeffs), 0.95, axis=(0, 1))
 
 
 def _select_edges(
@@ -297,8 +495,8 @@ def _boxplot_ylim(values: list[np.ndarray], signed: bool, percentile: float) -> 
     return -0.02 * upper, 1.08 * upper
 
 
-def _edge_label(target: int, source: int, names: list[str]) -> str:
-    return f"{names[source]} -> {names[target]}"
+def _edge_label(target: int, source: int, names: list[str], sources=None) -> str:
+    return f"{(names if sources is None else sources)[source]} -> {names[target]}"
 
 
 def plot_edge_lag_boxplots(
@@ -309,6 +507,12 @@ def plot_edge_lag_boxplots(
     exclude_self: bool = True,
     value: BoxplotValueName = "signed",
     variable_names: list[str] | tuple[str, ...] | None = None,
+    branch: str = "endogenous",
+    target_names=None,
+    source_names=None,
+    data=None,
+    exog_inputs=None,
+    batch_size: int = 256,
     percentile_ylim: float = 99.0,
     title: str = "Effective coefficient distributions by lag",
     figsize: tuple[float, float] | None = None,
@@ -321,30 +525,34 @@ def plot_edge_lag_boxplots(
 ) -> tuple[Any, Any]:
     """Plot per-edge boxplots with lag on the x-axis and coefficient on the y-axis.
 
+    VARX supports separate branches and rectangular target/source axes. Supply
+    data to evaluate the requested train/valid/test inputs; without data the
+    fitted result's cached coefficients are used for backward compatibility.
+    Invalid source/lag combinations are shaded, never treated as observations.
+
     ``edges`` are specified as ``(target, source)`` pairs, matching the tensor
     convention ``coeffs[:, lag, target, source]``. If ``edges`` is omitted, the
     strongest edges are selected from ``result.causal_strength``.
     """
-    _get_gate(result)
     plt = _require_matplotlib()
-    coeffs = _get_coeffs(result)
+    coeffs = _branch_coeffs(result, branch, data, exog_inputs, batch_size)
+    _, lags, names, sources = _branch_gate(result, branch, variable_names, target_names, source_names)
     n_samples, order, n_targets, n_sources = coeffs.shape
-    if n_targets != n_sources:
-        raise ValueError("coeffs must be square in target/source dimensions.")
     if n_samples == 0:
         raise ValueError("result.coeffs must contain at least one sample.")
     if value not in ("signed", "absolute"):
         raise ValueError("value must be 'signed' or 'absolute'.")
 
-    names = _resolve_variable_names(n_targets, variable_names)
-    selected_edges = _select_edges(result, coeffs, edges, top_n=top_n, exclude_self=exclude_self)
+    selected_edges = _select_edges(None if data is not None else result, coeffs, edges,
+                                   top_n=top_n, exclude_self=exclude_self and branch == "endogenous")
     if not selected_edges:
         raise ValueError("no edges selected for plotting.")
 
     signed = value == "signed"
     edge_values = []
     for target, source in selected_edges:
-        lag_values = [coeffs[:, lag_idx, target, source] for lag_idx in range(order)]
+        lag_values = [coeffs[:, k, target, source] for k in range(order)
+                      if np.isfinite(coeffs[:, k, target, source]).any()]
         if not signed:
             lag_values = [np.abs(values) for values in lag_values]
         edge_values.extend(lag_values)
@@ -355,9 +563,10 @@ def plot_edge_lag_boxplots(
         ncols = min(3, n_panels)
     nrows = ceil(n_panels / ncols)
     if figsize is None:
-        figsize = (3.5 * ncols + 0.6, 2.8 * nrows + 0.9)
+        panel_width = max(3.5, 0.65 * order + 0.9)
+        figsize = (panel_width * ncols + 0.6, 2.8 * nrows + 0.9)
 
-    xlabels = [str(order - lag_idx) for lag_idx in range(order)]
+    xlabels = [_lag_title(lag) for lag in lags]
     ylabel = "effective coefficient" if signed else "|effective coefficient|"
 
     with plt.rc_context(_PAPER_RC):
@@ -373,7 +582,8 @@ def plot_edge_lag_boxplots(
 
         for idx, (target, source) in enumerate(selected_edges):
             ax = axes.flat[idx]
-            values_by_lag = [coeffs[:, lag_idx, target, source] for lag_idx in range(order)]
+            valid_lags = [k for k in range(order) if np.isfinite(coeffs[:, k, target, source]).any()]
+            values_by_lag = [coeffs[:, k, target, source] for k in valid_lags]
             if not signed:
                 values_by_lag = [np.abs(values) for values in values_by_lag]
 
@@ -381,6 +591,7 @@ def plot_edge_lag_boxplots(
                 values_by_lag,
                 patch_artist=True,
                 widths=0.58,
+                positions=np.asarray(valid_lags) + 1,
                 showmeans=True,
                 showfliers=False,
                 medianprops={"color": median_color, "linewidth": 1.5},
@@ -402,7 +613,9 @@ def plot_edge_lag_boxplots(
             if signed:
                 ax.axhline(0.0, color="#333333", linewidth=0.9, linestyle="--", alpha=0.7)
             ax.set_ylim(ymin, ymax)
-            ax.set_title(_edge_label(target, source, names), fontsize=10, fontweight="semibold")
+            ax.set_title(_edge_label(target, source, names, sources), fontsize=10, fontweight="semibold")
+            for k in set(range(order)) - set(valid_lags):
+                ax.axvspan(k + 0.6, k + 1.4, color="#BDBDBD", alpha=0.35)
             ax.set_xticks(np.arange(1, order + 1))
             ax.set_xticklabels(xlabels)
             ax.set_xlabel("lag")

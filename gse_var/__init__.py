@@ -2,6 +2,8 @@
 
 from importlib import import_module
 
+from .exogenous import ExogenousFeature, ExogenousLayout
+
 from .data import (
     LaggedDataset,
     VARXLaggedDataset,
@@ -11,6 +13,12 @@ from .data import (
 
 __all__ = [
     "CMLP",
+    "ExogenousFeature",
+    "ExogenousLayout",
+    "evaluate_coefficients",
+    "causal_gate_matrices",
+    "plot_causal_graph_matrix",
+    "plot_edge_lag_forest",
     "CMLPFitResult",
     "CMLPTrainingConfig",
     "GSEVARFitResult",
@@ -47,6 +55,10 @@ __all__ = [
 ]
 
 _LAZY_ATTRS = {
+    "evaluate_coefficients": ("gse_var.prediction", "evaluate_coefficients"),
+    "causal_gate_matrices": ("gse_var.visualization", "causal_gate_matrices"),
+    "plot_causal_graph_matrix": ("gse_var.visualization", "plot_causal_graph_matrix"),
+    "plot_edge_lag_forest": ("gse_var.visualization", "plot_edge_lag_forest"),
     "CMLP": ("gse_var.cmlp", "CMLP"),
     "CMLPFitResult": ("gse_var.cmlp", "CMLPFitResult"),
     "CMLPTrainingConfig": ("gse_var.cmlp", "CMLPTrainingConfig"),

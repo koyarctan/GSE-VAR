@@ -10,7 +10,8 @@ from torch import nn
 
 from .data import VARXLaggedDataset, construct_varx_lagged_dataset
 from .models import GSEVARX
-from .regularizers import NGCRegularizer
+from .regularizers import ExogenousGroupRegularizer, NGCRegularizer, RegularizerName
+from .exogenous import ExogenousLayout
 from .training import (
     GSEVARTrainingConfig,
     _iter_batches,
@@ -37,6 +38,8 @@ class GSEVARXTrainingConfig(GSEVARTrainingConfig):
     sparse_group_lambda_exog: float | None = None
     sparse_l1_lambda_exog: float | None = None
     exogenous_gate_init: float | None = None
+    regularizer_exog: RegularizerName | None = None
+    exogenous_group_size_weights: bool = True
 
 
 @dataclass
@@ -50,6 +53,31 @@ class GSEVARXFitResult:
     endogenous_graph: np.ndarray | None = None
     exogenous_graph: np.ndarray | None = None
     exogenous_lags: np.ndarray | None = None
+    exogenous_layout: ExogenousLayout | None = None
+    endogenous_names: tuple[str, ...] | None = None
+    causal_threshold: float = 0.0
+    exogenous_term_graph: np.ndarray | None = None
+
+    @property
+    def exogenous_source_names(self):
+        return None if self.exogenous_layout is None else self.exogenous_layout.sources
+
+    @property
+    def exogenous_gate_by_lag(self):
+        gate = self.model.exogenous_gate.detach().cpu().numpy()
+        return gate if self.exogenous_layout is None else self.exogenous_layout.gate_by_lag(gate)
+
+    @property
+    def exogenous_graph_by_lag(self):
+        gate = self.exogenous_gate_by_lag
+        return np.where(np.isfinite(gate), (gate > self.causal_threshold).astype(float), np.nan)
+
+    @property
+    def exogenous_coeffs_by_lag(self):
+        if self.exogenous_coeffs is None:
+            return None
+        return (self.exogenous_coeffs if self.exogenous_layout is None else
+                self.exogenous_layout.coefficients_by_lag(self.exogenous_coeffs))
 
 
 @dataclass(frozen=True)
@@ -91,6 +119,9 @@ def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
     ):
         _validate_optional_nonnegative(name, getattr(config, name))
 
+    exog_name = config.regularizer_exog or config.regularizer
+    if exog_name not in ("none", "group_lasso", "sparse_group_lasso", "hierarchical_group_lasso"):
+        raise ValueError("unsupported regularizer_exog")
     exogenous_ngc = _resolved(config.lambda_ngc_exog, config.lambda_ngc)
     exogenous_group = _resolved(
         config.sparse_group_lambda_exog,
@@ -100,7 +131,7 @@ def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
         config.sparse_l1_lambda_exog,
         config.sparse_l1_lambda,
     )
-    if config.regularizer == "sparse_group_lasso":
+    if exog_name == "sparse_group_lasso":
         if exogenous_ngc != 0:
             raise ValueError(
                 "sparse_group_lasso does not use lambda_ngc_exog. Use "
@@ -109,7 +140,7 @@ def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
     elif exogenous_group != 0 or exogenous_l1 != 0:
         raise ValueError(
             "sparse_group_lambda_exog and sparse_l1_lambda_exog are only "
-            "used with regularizer='sparse_group_lasso'."
+                "used with the exogenous sparse_group_lasso regularizer."
         )
 
 
@@ -182,6 +213,7 @@ def _make_optimizer(
 
 def _make_regularizers(
     config: GSEVARXTrainingConfig,
+    layout: ExogenousLayout | None = None,
 ) -> tuple[NGCRegularizer, NGCRegularizer]:
     endogenous_regularizer = NGCRegularizer(
         name=config.regularizer,
@@ -191,11 +223,9 @@ def _make_regularizers(
         sparse_l1_lambda=config.sparse_l1_lambda,
         sparse_group_lambda=config.sparse_group_lambda,
     )
-    exogenous_regularizer = NGCRegularizer(
-        name=config.regularizer,
+    exogenous_kwargs = dict(
+        name=config.regularizer_exog or config.regularizer,
         lam=_resolved(config.lambda_ngc_exog, config.lambda_ngc),
-        reduction="sum",
-        lag_dim=0,
         sparse_l1_lambda=_resolved(
             config.sparse_l1_lambda_exog,
             config.sparse_l1_lambda,
@@ -204,6 +234,12 @@ def _make_regularizers(
             config.sparse_group_lambda_exog,
             config.sparse_group_lambda,
         ),
+    )
+    exogenous_regularizer = (
+        NGCRegularizer(**exogenous_kwargs, reduction="sum", lag_dim=0)
+        if layout is None else ExogenousGroupRegularizer(
+            **exogenous_kwargs, layout=layout, size_weights=config.exogenous_group_size_weights
+        )
     )
     return endogenous_regularizer, exogenous_regularizer
 
@@ -457,10 +493,15 @@ def _infer(
         endogenous_t,
         aggregation=config.strength_aggregation,
     )
-    exogenous_strength = model.coefficient_strength(
-        exogenous_t,
-        aggregation=config.strength_aggregation,
-    )
+    if model.exogenous_layout is None:
+        exogenous_strength = model.coefficient_strength(exogenous_t, aggregation=config.strength_aggregation)
+    else:
+        exogenous_strength = torch.stack([
+            model.coefficient_strength(
+                exogenous_t[:, 0].index_select(-1, torch.tensor(group)).permute(0, 2, 1).unsqueeze(-1),
+                aggregation=config.strength_aggregation).squeeze(-1)
+            for group in model.exogenous_layout.groups
+        ], dim=-1)
     endogenous_graph = model.endogenous_graph_from_gate(
         config.causal_threshold
     )
@@ -482,8 +523,22 @@ def fit_gse_varx(
     exog: np.ndarray | list[np.ndarray],
     config: GSEVARXTrainingConfig,
     model: GSEVARX | None = None,
+    *,
+    exog_features=None,
+    exog_names=None,
+    exog_lags=None,
+    known_future_exog=(),
+    endog_names=None,
 ) -> GSEVARXFitResult:
-    """Fit GSEVARX without assuming application-specific variable names."""
+    """Fit GSEVARX without assuming application-specific variable names.
+
+    Optional exog_features identifies already-expanded columns. Alternatively,
+    exog_names/exog_lags describe raw variables and allowed physical lags;
+    negative lags require known_future_exog. Layout-aware mode preserves one
+    joint packed exogenous coefficient generator, groups gates by original
+    source for each target, and returns source-level graphs/strengths while
+    keeping the coefficient tensor packed. Legacy uniform-lag mode is unchanged.
+    """
     _validate_varx_config(config)
     if config.seed is not None:
         np.random.seed(config.seed)
@@ -495,6 +550,8 @@ def fit_gse_varx(
         order=config.order,
         exog_order=config.exog_order,
         include_current_exog=config.include_current_exog,
+        exog_features=exog_features, exog_names=exog_names,
+        exog_lags=exog_lags, known_future_exog=known_future_exog,
     )
     device = _resolve_device(config.device)
     dataset = _to_torch_varx_dataset(dataset_np, device)
@@ -512,6 +569,7 @@ def fit_gse_varx(
             num_hidden_layers=config.num_hidden_layers,
             gate_init=config.gate_init,
             exogenous_gate_init=config.exogenous_gate_init,
+            exogenous_layout=dataset_np.exogenous_layout,
         )
     if model.num_endogenous != num_endogenous:
         raise ValueError(
@@ -523,6 +581,10 @@ def fit_gse_varx(
         )
     if model.order != config.order:
         raise ValueError("model order does not match config order")
+    if model.exogenous_layout != dataset_np.exogenous_layout:
+        raise ValueError("model exogenous identities do not match the dataset layout")
+    if endog_names is not None and len(endog_names) != num_endogenous:
+        raise ValueError("endog_names must match the endogenous variable count")
     if (
         model.exog_order != config.exog_order
         or model.include_current_exog != config.include_current_exog
@@ -533,7 +595,7 @@ def fit_gse_varx(
 
     model.to(device)
     model.project_causal_gates_()
-    endogenous_regularizer, exogenous_regularizer = _make_regularizers(config)
+    endogenous_regularizer, exogenous_regularizer = _make_regularizers(config, dataset_np.exogenous_layout)
     optimizer = _make_optimizer(config, model)
     criterion = nn.MSELoss(reduction="mean")
     rng = np.random.default_rng(config.seed)
@@ -586,4 +648,9 @@ def fit_gse_varx(
         endogenous_graph=endogenous_graph,
         exogenous_graph=exogenous_graph,
         exogenous_lags=dataset_np.exogenous_lags.copy(),
+        exogenous_layout=dataset_np.exogenous_layout,
+        endogenous_names=None if endog_names is None else tuple(endog_names),
+        causal_threshold=config.causal_threshold,
+        exogenous_term_graph=(model.exogenous_gate.detach().cpu().numpy()[0] > config.causal_threshold).astype(int)
+        if dataset_np.exogenous_layout is not None else None,
     )

@@ -5,6 +5,8 @@ from typing import Literal
 
 import torch
 
+from .exogenous import ExogenousLayout
+
 RegularizerName = Literal[
     "none",
     "sparse_group_lasso",
@@ -257,6 +259,85 @@ def prox_nonnegative_hierarchical_group_lasso_(
         )
     param.clamp_(min=0.0)
     return prox_hierarchical_group_lasso_(param, lam, step_size, eps=eps)
+
+
+@dataclass(frozen=True)
+class ExogenousGroupRegularizer:
+    """Gate selection per (target, original source) across its valid lags.
+
+    Groups are disjoint; sparse-group prox is nonnegative L1 shrinkage followed
+    by group shrinkage. Group weights optionally use sqrt(valid lag count).
+    No global lag padding or grouping across different targets is involved.
+    """
+
+    layout: ExogenousLayout
+    name: RegularizerName = "sparse_group_lasso"
+    lam: float = 0.0
+    sparse_l1_lambda: float = 0.0
+    sparse_group_lambda: float = 0.0
+    size_weights: bool = True
+
+    def __post_init__(self):
+        NGCRegularizer(name=self.name, lam=self.lam,
+                       sparse_l1_lambda=self.sparse_l1_lambda,
+                       sparse_group_lambda=self.sparse_group_lambda)
+        if self.name == "hierarchical_group_lasso" and any(f.lag < 0 for f in self.layout.features):
+            raise ValueError("hierarchical exogenous penalties do not support leads; use sparse_group_lasso")
+
+    def _blocks(self, tensor):
+        if tensor.ndim != 3 or tensor.shape[0] != 1 or tensor.shape[-1] != len(self.layout.features):
+            raise ValueError("source groups require gates [1, target, packed_feature]")
+        for group in self.layout.groups:
+            indices = sorted(group, key=lambda k: self.layout.features[k].lag, reverse=True)
+            yield indices, tensor[0, :, indices]
+
+    def _weight(self, n):
+        return n ** 0.5 if self.size_weights else 1.0
+
+    def penalty(self, tensor):
+        penalty = tensor.new_zeros(())
+        for _, block in self._blocks(tensor):
+            if self.name == "none":
+                continue
+            if self.name == "hierarchical_group_lasso":
+                for size in range(1, block.shape[-1] + 1):
+                    penalty = penalty + self.lam * self._weight(size) * torch.linalg.vector_norm(
+                        block[:, :size], dim=-1).sum()
+            else:
+                group_lam = self.sparse_group_lambda if self.name == "sparse_group_lasso" else self.lam
+                penalty = penalty + group_lam * self._weight(block.shape[-1]) * torch.linalg.vector_norm(
+                    block, dim=-1).sum()
+                if self.name == "sparse_group_lasso":
+                    penalty = penalty + self.sparse_l1_lambda * block.abs().sum()
+        return penalty
+
+    @torch.no_grad()
+    def prox_(self, param, step_size, *, nonnegative=False):
+        for indices, values in self._blocks(param):
+            block = values.clone()
+            if nonnegative:
+                block.clamp_(min=0)
+            if self.name == "none":
+                param[0, :, indices] = block
+                continue
+            if self.name == "sparse_group_lasso":
+                if nonnegative:
+                    block.sub_(step_size * self.sparse_l1_lambda).clamp_(min=0)
+                else:
+                    prox_lasso_(block, self.sparse_l1_lambda, step_size)
+                lam = self.sparse_group_lambda
+            else:
+                lam = self.lam
+            sizes = (range(1, block.shape[-1] + 1) if self.name == "hierarchical_group_lasso"
+                     else [block.shape[-1]])
+            for size in sizes:
+                sub = block[:, :size]
+                threshold = step_size * lam * self._weight(size)
+                norm = torch.linalg.vector_norm(sub, dim=-1, keepdim=True)
+                sub.mul_((1 - threshold / norm.clamp(min=1e-12)).clamp(min=0))
+                sub.masked_fill_(norm <= threshold, 0)
+            param[0, :, indices] = block
+        return param
 
 
 @dataclass(frozen=True)

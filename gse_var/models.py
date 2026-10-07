@@ -6,6 +6,8 @@ from typing import Literal
 import torch
 from torch import nn
 
+from .exogenous import ExogenousLayout
+
 AggregationName = Literal["max", "mean", "median"]
 
 # GVARの実装に必要なモジュール
@@ -439,6 +441,7 @@ class GSEVARX(nn.Module):
         num_hidden_layers: int = 1,
         gate_init: float = 1.0,
         exogenous_gate_init: float | None = None,
+        exogenous_layout: ExogenousLayout | None = None,
     ) -> None:
         super().__init__()
         if num_endogenous <= 0:
@@ -471,6 +474,11 @@ class GSEVARX(nn.Module):
         self.exog_order = exog_order
         self.include_current_exog = include_current_exog
         self.num_exogenous_terms = exog_order + int(include_current_exog)
+        if exogenous_layout is not None and (
+            self.num_exogenous_terms != 1 or num_exogenous != len(exogenous_layout.features)
+        ):
+            raise ValueError("exogenous_layout requires one packed term and matching feature count")
+        self.exogenous_layout = exogenous_layout
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
 
@@ -729,9 +737,14 @@ class GSEVARX(nn.Module):
         self,
         threshold: float = 0.0,
     ) -> torch.Tensor:
-        return (
-            self._gate_group_norms(self.exogenous_gate) > threshold
-        ).to(torch.int64)
+        if self.exogenous_layout is None:
+            norms = self._gate_group_norms(self.exogenous_gate)
+        else:
+            norms = torch.stack([
+                torch.linalg.vector_norm(self.exogenous_gate[0, :, group], dim=-1)
+                for group in self.exogenous_layout.groups
+            ], dim=-1)
+        return (norms > threshold).to(torch.int64)
 
     @staticmethod
     def coefficient_strength(

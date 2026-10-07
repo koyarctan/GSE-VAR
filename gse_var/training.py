@@ -52,6 +52,7 @@ class GSEVARFitResult:
     coeffs: np.ndarray | None = None
     causal_strength: np.ndarray | None = None
     causal_graph: np.ndarray | None = None
+    causal_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -467,4 +468,5 @@ def fit_gse_var(
         coeffs=coeffs,
         causal_strength=strength,
         causal_graph=graph,
+        causal_threshold=config.causal_threshold,
     )

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .exogenous import ExogenousLayout, _construct_variable_lag_dataset
+
 
 @dataclass(frozen=True)
 class LaggedDataset:
@@ -23,6 +25,7 @@ class VARXLaggedDataset:
     time_index: np.ndarray
     series_index: np.ndarray
     exogenous_lags: np.ndarray
+    exogenous_layout: ExogenousLayout | None = None
 
 
 def _as_series_list(data: np.ndarray | list[np.ndarray]) -> list[np.ndarray]:
@@ -84,6 +87,10 @@ def construct_varx_lagged_dataset(
     order: int,
     exog_order: int = 0,
     include_current_exog: bool = True,
+    exog_features=None,
+    exog_names=None,
+    exog_lags=None,
+    known_future_exog=(),
 ) -> VARXLaggedDataset:
     """Build aligned predictors for a generic GSEVARX model.
 
@@ -96,7 +103,26 @@ def construct_varx_lagged_dataset(
 
     Lists of arrays are supported for multiple independent series. Endogenous
     and exogenous lists must be aligned one-to-one and have equal lengths.
+
+    Alternatively, supply ``exog_names`` and a complete ``exog_lags`` mapping
+    for raw columns, or ``exog_features`` for already expanded columns. These
+    modes pack valid source/lag pairs into ``[sample, 1, feature]`` and retain
+    an ExogenousLayout. They require exog_order=0/include_current_exog=True;
+    this describes the packed representation, not the physical lag numbers.
+    Raw known-ahead leads require an explicit known_future_exog declaration;
+    extended exog rows may cover these leads at the end of an endog block.
+    Without such rows, end-of-block responses needing leads are trimmed.
     """
+    if exog_features is not None or exog_lags is not None:
+        if exog_order != 0 or not include_current_exog:
+            raise ValueError("variable-specific inputs require exog_order=0 and include_current_exog=True")
+        return _construct_variable_lag_dataset(
+            endog, exog, order=order, exog_features=exog_features,
+            exog_names=exog_names, exog_lags=exog_lags,
+            known_future_exog=known_future_exog,
+        )
+    if exog_names is not None or known_future_exog:
+        raise ValueError("exog_names/known_future_exog require exog_lags")
     if order <= 0:
         raise ValueError("order must be positive")
     if exog_order < 0:
