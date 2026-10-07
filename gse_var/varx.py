@@ -26,8 +26,10 @@ class GSEVARXTrainingConfig(GSEVARTrainingConfig):
     """Training configuration for generic endogenous/exogenous GSEVARX.
 
     Existing regularization fields apply to the endogenous branch. Optional
-    ``*_exog`` values override them for the exogenous branch; ``None`` reuses
-    the corresponding endogenous value.
+    ``*_exog`` values override them for the exogenous branch. Gate penalty
+    weights set to ``None`` reuse the corresponding endogenous value only
+    when supported by the selected exogenous regularizer; otherwise they
+    resolve to zero. Other ``None`` overrides always reuse the endogenous value.
     """
 
     exog_order: int = 0
@@ -93,6 +95,28 @@ def _resolved(value: float | None, fallback: float) -> float:
     return fallback if value is None else value
 
 
+def _exogenous_regularizer_kwargs(config: GSEVARXTrainingConfig) -> dict:
+    """Resolve compatible inherited gate weights without mutating config."""
+    name = config.regularizer_exog or config.regularizer
+    uses_ngc = name in ("group_lasso", "hierarchical_group_lasso")
+    uses_sparse = name == "sparse_group_lasso"
+    return dict(
+        name=name,
+        lam=_resolved(
+            config.lambda_ngc_exog,
+            config.lambda_ngc if uses_ngc else 0.0,
+        ),
+        sparse_l1_lambda=_resolved(
+            config.sparse_l1_lambda_exog,
+            config.sparse_l1_lambda if uses_sparse else 0.0,
+        ),
+        sparse_group_lambda=_resolved(
+            config.sparse_group_lambda_exog,
+            config.sparse_group_lambda if uses_sparse else 0.0,
+        ),
+    )
+
+
 def _validate_optional_nonnegative(
     name: str,
     value: float | None,
@@ -122,22 +146,17 @@ def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
     exog_name = config.regularizer_exog or config.regularizer
     if exog_name not in ("none", "group_lasso", "sparse_group_lasso", "hierarchical_group_lasso"):
         raise ValueError("unsupported regularizer_exog")
-    exogenous_ngc = _resolved(config.lambda_ngc_exog, config.lambda_ngc)
-    exogenous_group = _resolved(
-        config.sparse_group_lambda_exog,
-        config.sparse_group_lambda,
-    )
-    exogenous_l1 = _resolved(
-        config.sparse_l1_lambda_exog,
-        config.sparse_l1_lambda,
-    )
+    exogenous_kwargs = _exogenous_regularizer_kwargs(config)
     if exog_name == "sparse_group_lasso":
-        if exogenous_ngc != 0:
+        if exogenous_kwargs["lam"] != 0:
             raise ValueError(
                 "sparse_group_lasso does not use lambda_ngc_exog. Use "
                 "sparse_group_lambda_exog and sparse_l1_lambda_exog instead."
             )
-    elif exogenous_group != 0 or exogenous_l1 != 0:
+    elif (
+        exogenous_kwargs["sparse_group_lambda"] != 0
+        or exogenous_kwargs["sparse_l1_lambda"] != 0
+    ):
         raise ValueError(
             "sparse_group_lambda_exog and sparse_l1_lambda_exog are only "
                 "used with the exogenous sparse_group_lasso regularizer."
@@ -223,18 +242,7 @@ def _make_regularizers(
         sparse_l1_lambda=config.sparse_l1_lambda,
         sparse_group_lambda=config.sparse_group_lambda,
     )
-    exogenous_kwargs = dict(
-        name=config.regularizer_exog or config.regularizer,
-        lam=_resolved(config.lambda_ngc_exog, config.lambda_ngc),
-        sparse_l1_lambda=_resolved(
-            config.sparse_l1_lambda_exog,
-            config.sparse_l1_lambda,
-        ),
-        sparse_group_lambda=_resolved(
-            config.sparse_group_lambda_exog,
-            config.sparse_group_lambda,
-        ),
-    )
+    exogenous_kwargs = _exogenous_regularizer_kwargs(config)
     exogenous_regularizer = (
         NGCRegularizer(**exogenous_kwargs, reduction="sum", lag_dim=0)
         if layout is None else ExogenousGroupRegularizer(

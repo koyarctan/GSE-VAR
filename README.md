@@ -287,8 +287,9 @@ only `exog[t]`.
 
 The endogenous and exogenous branches have separate coefficient generators,
 gates, strength maps, and graphs. Existing regularization fields configure the
-endogenous branch. The following optional fields override them for the
-exogenous branch; leaving one as `None` reuses the endogenous value:
+endogenous branch. `regularizer_exog` selects the exogenous gate penalty;
+leaving it as `None` uses the endogenous regularizer. The following optional
+fields override their endogenous counterparts:
 
 - `lambda_ngc_exog`
 - `lambda_smooth_exog`
@@ -296,6 +297,17 @@ exogenous branch; leaving one as `None` reuses the endogenous value:
 - `sparse_group_lambda_exog`
 - `sparse_l1_lambda_exog`
 - `exogenous_gate_init`
+
+For gate penalty weights, `None` inherits only a weight supported by the
+selected exogenous regularizer. Group and hierarchical group lasso use
+`lambda_ngc_exog`; sparse group lasso uses `sparse_group_lambda_exog` and
+`sparse_l1_lambda_exog`. Unused omitted weights resolve to zero, so selecting
+a different exogenous penalty does not require explicit zero overrides.
+Same-regularizer inheritance is preserved. An explicitly nonzero
+`lambda_ngc_exog` with sparse group lasso, or explicitly nonzero sparse-group
+weights with another regularizer, still raises a configuration error.
+The smoothness, Jacobian, and gate-initialization overrides always inherit
+their endogenous values when omitted.
 
 Coefficient/Jacobian diagnostics are also reported separately:
 
@@ -354,7 +366,7 @@ config = GSEVARXTrainingConfig(
     order=5, hidden_layer_size=100,
     exog_order=0, include_current_exog=True,
     regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
-    regularizer_exog="sparse_group_lasso", lambda_ngc_exog=0.0,
+    regularizer_exog="sparse_group_lasso",
     sparse_group_lambda_exog=0.01, sparse_l1_lambda_exog=0.005,
     coefficient_weight_decay=1e-4, optimizer="ista", causal_threshold=0,
 )

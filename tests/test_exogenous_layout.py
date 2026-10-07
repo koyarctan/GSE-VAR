@@ -136,7 +136,7 @@ def test_training_separate_regularizers_shapes_and_jacobian_gate_detachment(opti
     y, x = rng.normal(size=(12, 2)), rng.normal(size=(12, 6))
     cfg = GSEVARXTrainingConfig(order=2, hidden_layer_size=3, max_epochs=1, batch_size=16,
                                 regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
-                                regularizer_exog="sparse_group_lasso", lambda_ngc_exog=0,
+                                regularizer_exog="sparse_group_lasso",
                                 sparse_group_lambda_exog=0.02, sparse_l1_lambda_exog=0.01,
                                 lambda_jacobian=0.1, optimizer=optimizer, strength_aggregation=aggregation,
                                 verbose=0, device="cpu")
@@ -199,7 +199,7 @@ def test_raw_api_fit_and_evaluation_layouts_agree():
                   known_future_exog=["calendar"])
     cfg = GSEVARXTrainingConfig(order=2, hidden_layer_size=2, max_epochs=1,
                                 regularizer="group_lasso", lambda_ngc=0.01,
-                                regularizer_exog="sparse_group_lasso", lambda_ngc_exog=0,
+                                regularizer_exog="sparse_group_lasso",
                                 sparse_group_lambda_exog=0.01, verbose=0)
     result = fit_gse_varx(y, x, cfg, **kwargs)
     ds = construct_varx_lagged_dataset(y, x, order=2, **kwargs)
