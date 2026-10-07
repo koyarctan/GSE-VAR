@@ -341,6 +341,64 @@ effects, not automatically identified intervention effects. In particular,
 prices must satisfy the assumed exogeneity or be handled with an appropriate
 identification strategy before interpreting coefficients causally.
 
+### Optional early stopping for GSE-VARX
+
+Early stopping is disabled by default. Enable it with `early_stopping=True`
+and explicitly supply `validation_data`: either a `VARXLaggedDataset` (such
+as the previously prepared `inputs["valid"]`), or a tuple `(endog_valid,
+exog_valid)` of raw/already-expanded blocks with the same lag metadata.
+Missing validation data raises an error; training MSE is never silently
+substituted. No automatic random split or validation-to-training concatenation
+is performed. Use chronological train/validation/test splits, training-fitted
+scales and the same feature order; test data must stay out of model selection.
+For rolling one-step evaluation, validation blocks may include observed past
+context before their first validation response.
+
+```python
+from dataclasses import replace
+
+config = replace(
+    config,
+    early_stopping=True,
+    early_stopping_patience=200,
+    early_stopping_min_delta=1e-5,
+    restore_best_weights=True,
+)
+result = fit_gse_varx(
+    prepared["train"]["endog"], prepared["train"]["exog"], config,
+    exog_features=features, endog_names=prepared["endog_names_ja"],
+    validation_data=inputs["valid"],
+)
+print(result.best_epoch, result.epochs_trained, result.best_validation_mse)
+```
+
+Each epoch monitors pure validation prediction MSE, averaged over all response
+elements (not equally weighted batch means). Sparsity, smoothness, Jacobian and
+weight-decay penalties are excluded. Validation uses `eval`/`no_grad` and does
+not update gates, coefficients, optimizer state, or training gradients.
+`early_stopping_patience` defaults to 100 and must be a positive integer.
+`early_stopping_min_delta` defaults to zero: a patience reset requires a drop
+strictly greater than this absolute MSE amount, relative to the previous
+significant improvement. Small improvements can accumulate toward that drop.
+
+With early stopping enabled, `restore_best_weights=True` (the default) restores
+the actual minimum-MSE epoch, including both gates, even if `max_epochs` is
+reached before patience expires. The minimum is saved even when its improvement
+is smaller than `min_delta`; that setting controls stopping patience only.
+Snapshots are held in CPU memory, not written to disk. Set
+`restore_best_weights=False` to retain the stopping epoch's weights instead.
+Coefficients, strengths and graphs are recomputed on the training inputs after
+restoration. `history["val_mse"]` retains every evaluated epoch; its final entry
+need not correspond to the restored model. The result also reports `best_epoch`
+(one-based), `best_validation_mse`, `epochs_trained`, `early_stopped`, and
+`stopped_epoch` (`None` if patience was not reached).
+
+Supplying validation data with `early_stopping=False` only logs validation MSE
+and its best epoch: it does not shorten training or restore weights. Existing
+calls without validation data retain their original training behavior.
+These options currently apply to `GSEVARXTrainingConfig` / `fit_gse_varx`, not
+the standalone GSE-VAR or baseline trainers.
+
 ### Variable-specific exogenous lags and source-level selection
 
 For different lag sets, keep original source/lag identities rather than

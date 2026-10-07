@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
+from numbers import Integral
 
 import numpy as np
 import torch
@@ -42,6 +43,10 @@ class GSEVARXTrainingConfig(GSEVARTrainingConfig):
     exogenous_gate_init: float | None = None
     regularizer_exog: RegularizerName | None = None
     exogenous_group_size_weights: bool = True
+    early_stopping: bool = False
+    early_stopping_patience: int = 100
+    early_stopping_min_delta: float = 0.0
+    restore_best_weights: bool = True
 
 
 @dataclass
@@ -59,6 +64,11 @@ class GSEVARXFitResult:
     endogenous_names: tuple[str, ...] | None = None
     causal_threshold: float = 0.0
     exogenous_term_graph: np.ndarray | None = None
+    best_epoch: int | None = None
+    best_validation_mse: float | None = None
+    epochs_trained: int = 0
+    early_stopped: bool = False
+    stopped_epoch: int | None = None
 
     @property
     def exogenous_source_names(self):
@@ -127,6 +137,19 @@ def _validate_optional_nonnegative(
 
 def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
     _validate_config(config)
+    if not isinstance(config.early_stopping, bool):
+        raise ValueError("early_stopping must be a bool")
+    if not isinstance(config.restore_best_weights, bool):
+        raise ValueError("restore_best_weights must be a bool")
+    if (isinstance(config.early_stopping_patience, bool)
+            or not isinstance(config.early_stopping_patience, Integral)
+            or config.early_stopping_patience <= 0):
+        raise ValueError("early_stopping_patience must be a positive integer")
+    if (not math.isfinite(config.early_stopping_min_delta)
+            or config.early_stopping_min_delta < 0):
+        raise ValueError("early_stopping_min_delta must be finite and non-negative")
+    if config.early_stopping and config.max_epochs < 1:
+        raise ValueError("early stopping requires max_epochs >= 1")
     if config.exog_order < 0:
         raise ValueError("exog_order must be non-negative")
     if config.exog_order == 0 and not config.include_current_exog:
@@ -228,6 +251,79 @@ def _make_optimizer(
             lr=config.learning_rate,
         )
     raise ValueError(f"unsupported optimizer: {config.optimizer}")
+
+
+def _prepare_validation_dataset(
+    validation_data,
+    training: VARXLaggedDataset,
+    lag_kwargs: dict,
+) -> VARXLaggedDataset | None:
+    """Reuse explicit validation inputs, without splitting or fitting scales."""
+    if validation_data is None:
+        return None
+    if isinstance(validation_data, VARXLaggedDataset):
+        dataset = validation_data
+    elif isinstance(validation_data, tuple) and len(validation_data) == 2:
+        dataset = construct_varx_lagged_dataset(*validation_data, **lag_kwargs)
+    else:
+        raise ValueError("validation_data must be a VARXLaggedDataset or an (endog, exog) tuple")
+
+    y = np.asarray(dataset.endogenous_predictors, dtype=np.float32)
+    x = np.asarray(dataset.exogenous_predictors, dtype=np.float32)
+    responses = np.asarray(dataset.responses, dtype=np.float32)
+    if responses.ndim != 2 or not len(responses):
+        raise ValueError("validation responses must be nonempty [sample, target]")
+    n = len(responses)
+    if y.shape != (n,) + training.endogenous_predictors.shape[1:]:
+        raise ValueError("validation endogenous predictor shape does not match training")
+    if x.shape != (n,) + training.exogenous_predictors.shape[1:]:
+        raise ValueError("validation exogenous predictor shape does not match training")
+    if responses.shape[1:] != training.responses.shape[1:]:
+        raise ValueError("validation response shape does not match training")
+    if dataset.exogenous_layout != training.exogenous_layout:
+        raise ValueError("validation exogenous identities do not match training")
+    if not np.array_equal(dataset.exogenous_lags, training.exogenous_lags):
+        raise ValueError("validation exogenous lags do not match training")
+    if not all(np.isfinite(values).all() for values in (y, x, responses)):
+        raise ValueError("validation predictors and responses must be finite")
+    times, series = np.asarray(dataset.time_index), np.asarray(dataset.series_index)
+    if times.shape != (n,) or series.shape != (n,):
+        raise ValueError("validation sample indices do not match response count")
+    return VARXLaggedDataset(
+        endogenous_predictors=y, exogenous_predictors=x, responses=responses,
+        time_index=times, series_index=series,
+        exogenous_lags=dataset.exogenous_lags, exogenous_layout=dataset.exogenous_layout,
+    )
+
+
+@torch.no_grad()
+def _validation_mse(
+    model: GSEVARX,
+    dataset: _TorchVARXLaggedDataset,
+    batch_size: int,
+) -> float:
+    """Pure prediction MSE, weighted by all response elements, not batches."""
+    if batch_size <= 0:
+        raise ValueError("validation requires a positive batch_size")
+    was_training = model.training
+    model.eval()
+    try:
+        total = torch.zeros((), dtype=torch.float64, device=dataset.responses.device)
+        for start in range(0, len(dataset.responses), batch_size):
+            stop = start + batch_size
+            predictions, _, _ = model(
+                dataset.endogenous_predictors[start:stop],
+                dataset.exogenous_predictors[start:stop],
+            )
+            total += nn.functional.mse_loss(
+                predictions, dataset.responses[start:stop], reduction="sum",
+            ).double()
+        value = float((total / dataset.responses.numel()).cpu())
+    finally:
+        model.train(was_training)
+    if not math.isfinite(value):
+        raise ValueError("validation MSE must be finite; check training stability")
+    return value
 
 
 def _make_regularizers(
@@ -454,6 +550,7 @@ def _log_epoch(
     endogenous_active, endogenous_total, exogenous_active, exogenous_total = (
         _gate_usage(model, config.causal_threshold)
     )
+    validation_log = f"val_mse={metrics['val_mse']:.6g} | " if "val_mse" in metrics else ""
     log_fn(
         f"Epoch {epoch:>4}/{config.max_epochs:<4} | "
         f"loss={metrics['loss']:.6g} | "
@@ -461,6 +558,7 @@ def _log_epoch(
         f"ngc={metrics['ngc']:.6g} | "
         f"smooth={metrics['smooth']:.6g} | "
         f"jacobian={metrics['jacobian']:.6g} | "
+        f"{validation_log}"
         f"endog_edges={endogenous_active}/{endogenous_total} | "
         f"exog_edges={exogenous_active}/{exogenous_total}"
     )
@@ -537,6 +635,7 @@ def fit_gse_varx(
     exog_lags=None,
     known_future_exog=(),
     endog_names=None,
+    validation_data: VARXLaggedDataset | tuple | None = None,
 ) -> GSEVARXFitResult:
     """Fit GSEVARX without assuming application-specific variable names.
 
@@ -546,23 +645,38 @@ def fit_gse_varx(
     joint packed exogenous coefficient generator, groups gates by original
     source for each target, and returns source-level graphs/strengths while
     keeping the coefficient tensor packed. Legacy uniform-lag mode is unchanged.
+
+    Optional validation_data is a preconstructed VARXLaggedDataset or a tuple
+    of raw/already-expanded (endog, exog) blocks using the same lag metadata.
+    With early_stopping=True it is required. Monitor pure validation MSE once
+    per epoch, stopping after patience consecutive epochs without an improvement
+    exceeding min_delta. By default restore the lowest-MSE epoch's full state,
+    including gates, before inferring coefficients/graphs on training inputs.
+    min_delta controls patience resets, not which minimum-MSE state is saved.
+    No automatic split, standardization, or validation-to-training concatenation
+    is performed; chronological splits and observed context are caller-owned.
     """
     _validate_varx_config(config)
+    if config.early_stopping and validation_data is None:
+        raise ValueError("early_stopping=True requires explicit validation_data")
+    if validation_data is not None and (config.max_epochs < 1 or config.batch_size < 1):
+        raise ValueError("validation requires positive max_epochs and batch_size")
     if config.seed is not None:
         np.random.seed(config.seed)
         torch.manual_seed(config.seed)
 
-    dataset_np = construct_varx_lagged_dataset(
-        endog,
-        exog,
+    lag_kwargs = dict(
         order=config.order,
         exog_order=config.exog_order,
         include_current_exog=config.include_current_exog,
         exog_features=exog_features, exog_names=exog_names,
         exog_lags=exog_lags, known_future_exog=known_future_exog,
     )
+    dataset_np = construct_varx_lagged_dataset(endog, exog, **lag_kwargs)
+    validation_np = _prepare_validation_dataset(validation_data, dataset_np, lag_kwargs)
     device = _resolve_device(config.device)
     dataset = _to_torch_varx_dataset(dataset_np, device)
+    validation = None if validation_np is None else _to_torch_varx_dataset(validation_np, device)
     num_endogenous = dataset.endogenous_predictors.shape[-1]
     num_exogenous = dataset.exogenous_predictors.shape[-1]
 
@@ -621,6 +735,13 @@ def fit_gse_varx(
         "jacobian_exogenous",
     )
     history = {name: [] for name in metric_names}
+    if validation is not None:
+        history["val_mse"] = []
+    best_epoch, best_state = None, None
+    best_validation_mse = math.inf
+    patience_reference = math.inf
+    bad_epochs = 0
+    stopped_epoch = None
 
     for epoch in range(1, config.max_epochs + 1):
         metrics = _epoch(
@@ -636,7 +757,31 @@ def fit_gse_varx(
         )
         for name, value in metrics.items():
             history[name].append(value)
+        if validation is not None:
+            val_mse = _validation_mse(model, validation, config.batch_size)
+            metrics["val_mse"] = val_mse
+            history["val_mse"].append(val_mse)
+            if val_mse < best_validation_mse:
+                best_validation_mse, best_epoch = val_mse, epoch
+                if config.early_stopping and config.restore_best_weights:
+                    best_state = {name: value.detach().cpu().clone()
+                                  for name, value in model.state_dict().items()}
+            if val_mse < patience_reference - config.early_stopping_min_delta:
+                patience_reference, bad_epochs = val_mse, 0
+            else:
+                bad_epochs += 1
         _log_epoch(epoch, config, metrics, model)
+        if config.early_stopping and bad_epochs >= config.early_stopping_patience:
+            stopped_epoch = epoch
+            if config.verbose > 0:
+                print(f"Early stopping at epoch {epoch}; best epoch={best_epoch}, "
+                      f"best val_mse={best_validation_mse:.6g}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        if config.verbose > 0:
+            print(f"Restored best weights from epoch {best_epoch}")
 
     (
         endogenous_coeffs,
@@ -661,4 +806,9 @@ def fit_gse_varx(
         causal_threshold=config.causal_threshold,
         exogenous_term_graph=(model.exogenous_gate.detach().cpu().numpy()[0] > config.causal_threshold).astype(int)
         if dataset_np.exogenous_layout is not None else None,
+        best_epoch=best_epoch,
+        best_validation_mse=None if best_epoch is None else best_validation_mse,
+        epochs_trained=len(history["loss"]),
+        early_stopped=stopped_epoch is not None,
+        stopped_epoch=stopped_epoch,
     )
