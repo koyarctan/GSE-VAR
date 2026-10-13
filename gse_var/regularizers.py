@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+import math
+from typing import ClassVar, Literal
 
 import torch
 
@@ -14,6 +15,7 @@ RegularizerName = Literal[
     "hierarchical_group_lasso",
 ]
 ReductionName = Literal["sum", "mean"]
+EndogenousGroupingName = Literal["own_other", "edge"]
 
 
 def _group_norms_by_pair(tensor: torch.Tensor, lag_dim: int) -> torch.Tensor:
@@ -262,11 +264,66 @@ def prox_nonnegative_hierarchical_group_lasso_(
 
 
 @dataclass(frozen=True)
+class OwnOtherSparseGroupRegularizer:
+    """Unweighted Sparse Own/Other penalty on endogenous structural gates.
+
+    Following VARX-L (Nicholson et al., 2017, Table 1, Eq. 7), each lag has
+    two disjoint groups: its diagonal (own) and off-diagonal (other) entries.
+    Elementwise L1 sparsity is followed by independent group shrinkage.
+    Unlike the paper, the groups have no cardinality multipliers and the
+    penalty acts on gates, not on linear coefficients. No own edge is forced
+    to remain and no arbitrary own/other penalty ratio is introduced.
+    """
+
+    sparse_l1_lambda: float = 0.0
+    sparse_group_lambda: float = 0.0
+    name: ClassVar[RegularizerName] = "sparse_group_lasso"
+    lam: ClassVar[float] = 0.0
+
+    def __post_init__(self):
+        for value in (self.sparse_l1_lambda, self.sparse_group_lambda):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("sparse penalty strengths must be finite and non-negative")
+
+    @staticmethod
+    def _mask(tensor):
+        if tensor.ndim != 3 or tensor.shape[-2] != tensor.shape[-1]:
+            raise ValueError("own/other grouping expects [lag, target, source] with square matrices")
+        return torch.eye(tensor.shape[-1], dtype=torch.bool, device=tensor.device)
+
+    def penalty(self, tensor):
+        mask = self._mask(tensor)
+        group_norms = torch.linalg.vector_norm(tensor[:, mask], dim=-1)
+        if tensor.shape[-1] > 1:
+            group_norms = group_norms + torch.linalg.vector_norm(tensor[:, ~mask], dim=-1)
+        return (self.sparse_group_lambda * group_norms.sum()
+                + self.sparse_l1_lambda * tensor.abs().sum())
+
+    @torch.no_grad()
+    def prox_(self, param, step_size, *, nonnegative=False):
+        mask = self._mask(param)
+        if nonnegative:
+            prox_nonnegative_lasso_(param, self.sparse_l1_lambda, step_size)
+        else:
+            prox_lasso_(param, self.sparse_l1_lambda, step_size)
+        threshold = step_size * self.sparse_group_lambda
+        group_masks = (mask, ~mask) if param.shape[-1] > 1 else (mask,)
+        for group_mask in group_masks:
+            block = param[:, group_mask]
+            norms = torch.linalg.vector_norm(block, dim=-1, keepdim=True)
+            block.mul_((1 - threshold / norms.clamp(min=1e-12)).clamp(min=0))
+            block.masked_fill_(norms <= threshold, 0)
+            param[:, group_mask] = block
+        return param
+
+
+@dataclass(frozen=True)
 class ExogenousGroupRegularizer:
     """Gate selection per (target, original source) across its valid lags.
 
     Groups are disjoint; sparse-group prox is nonnegative L1 shrinkage followed
-    by group shrinkage. Group weights optionally use sqrt(valid lag count).
+    by group shrinkage. Group and nested-group norms are unweighted, regardless
+    of the number of valid lags.
     No global lag padding or grouping across different targets is involved.
     """
 
@@ -275,7 +332,6 @@ class ExogenousGroupRegularizer:
     lam: float = 0.0
     sparse_l1_lambda: float = 0.0
     sparse_group_lambda: float = 0.0
-    size_weights: bool = True
 
     def __post_init__(self):
         NGCRegularizer(name=self.name, lam=self.lam,
@@ -291,9 +347,6 @@ class ExogenousGroupRegularizer:
             indices = sorted(group, key=lambda k: self.layout.features[k].lag, reverse=True)
             yield indices, tensor[0, :, indices]
 
-    def _weight(self, n):
-        return n ** 0.5 if self.size_weights else 1.0
-
     def penalty(self, tensor):
         penalty = tensor.new_zeros(())
         for _, block in self._blocks(tensor):
@@ -301,11 +354,11 @@ class ExogenousGroupRegularizer:
                 continue
             if self.name == "hierarchical_group_lasso":
                 for size in range(1, block.shape[-1] + 1):
-                    penalty = penalty + self.lam * self._weight(size) * torch.linalg.vector_norm(
+                    penalty = penalty + self.lam * torch.linalg.vector_norm(
                         block[:, :size], dim=-1).sum()
             else:
                 group_lam = self.sparse_group_lambda if self.name == "sparse_group_lasso" else self.lam
-                penalty = penalty + group_lam * self._weight(block.shape[-1]) * torch.linalg.vector_norm(
+                penalty = penalty + group_lam * torch.linalg.vector_norm(
                     block, dim=-1).sum()
                 if self.name == "sparse_group_lasso":
                     penalty = penalty + self.sparse_l1_lambda * block.abs().sum()
@@ -332,7 +385,7 @@ class ExogenousGroupRegularizer:
                      else [block.shape[-1]])
             for size in sizes:
                 sub = block[:, :size]
-                threshold = step_size * lam * self._weight(size)
+                threshold = step_size * lam
                 norm = torch.linalg.vector_norm(sub, dim=-1, keepdim=True)
                 sub.mul_((1 - threshold / norm.clamp(min=1e-12)).clamp(min=0))
                 sub.masked_fill_(norm <= threshold, 0)

@@ -174,6 +174,9 @@ class GSEVAR(nn.Module):
     Consequently, if ``causal_gate[k, i, j] == 0``, source ``j`` has neither a
     direct coefficient path nor an indirect coefficient-generation path to
     target ``i`` at lag ``k``.
+
+    Gated models have a separate, input-independent prediction intercept by
+    default. It is not part of the coefficient tensor or the causal graph.
     """
 
     def __init__(
@@ -184,6 +187,7 @@ class GSEVAR(nn.Module):
         num_hidden_layers: int = 1,
         use_causal_gate: bool = True,
         gate_init: float = 1.0,
+        fit_intercept: bool | None = None,
     ) -> None:
         super().__init__()
         if num_vars <= 0:
@@ -202,6 +206,12 @@ class GSEVAR(nn.Module):
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
         self.use_causal_gate = use_causal_gate
+        # None preserves the original ungated GVAR baseline by default.
+        if fit_intercept is None:
+            fit_intercept = use_causal_gate
+        if not isinstance(fit_intercept, bool):
+            raise ValueError("fit_intercept must be a bool")
+        self.fit_intercept = fit_intercept
 
         if use_causal_gate:
             # Target-specific coefficient generators are required because each
@@ -234,8 +244,21 @@ class GSEVAR(nn.Module):
         else:
             self.register_parameter("causal_gate", None)
 
+        self.register_parameter(
+            "intercept", nn.Parameter(torch.zeros(num_vars)) if fit_intercept else None
+        )
+
     def reset_parameters(self) -> None:
         self.coeff_net.reset_parameters()
+        if getattr(self, "intercept", None) is not None:
+            with torch.no_grad():
+                self.intercept.zero_()
+
+    def _add_intercept(self, predictions: torch.Tensor) -> torch.Tensor:
+        # Old pickled models did not have an intercept; keep their inference
+        # unchanged rather than silently injecting an untrained parameter.
+        intercept = getattr(self, "intercept", None)
+        return predictions if intercept is None else predictions + intercept
 
     @torch.no_grad()
     def project_causal_gate_(self) -> torch.Tensor:
@@ -253,7 +276,7 @@ class GSEVAR(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _, coeffs, _, _ = self._coefficient_components(inputs)
         preds = torch.einsum("bkij,bkj->bi", coeffs, inputs)
-        return preds, coeffs
+        return self._add_intercept(preds), coeffs
 
     def _coefficient_components(
         self,
@@ -363,7 +386,7 @@ class GSEVAR(nn.Module):
             detach_causal_gate=False,
         )
         preds = torch.einsum("bkij,bkj->bi", coeffs, inputs)
-        return preds, coeffs, jacobian, mismatch
+        return self._add_intercept(preds), coeffs, jacobian, mismatch
 
     def coefficient_jacobian_mismatch_for_regularization(
         self,
@@ -422,7 +445,7 @@ class GSEVARX(nn.Module):
     The two additive branches use separate coefficient generators and
     non-negative structural gates:
 
-    ``prediction = endogenous_coefficients * endogenous_lags``
+    ``prediction = intercept + endogenous_coefficients * endogenous_lags``
     ``           + exogenous_coefficients * exogenous_terms``.
 
     Coefficients and gates have layouts ``[batch, lag, target, source]`` and
@@ -442,6 +465,7 @@ class GSEVARX(nn.Module):
         gate_init: float = 1.0,
         exogenous_gate_init: float | None = None,
         exogenous_layout: ExogenousLayout | None = None,
+        fit_intercept: bool = True,
     ) -> None:
         super().__init__()
         if num_endogenous <= 0:
@@ -458,6 +482,8 @@ class GSEVARX(nn.Module):
             )
         if hidden_layer_size <= 0:
             raise ValueError("hidden_layer_size must be positive")
+        if not isinstance(fit_intercept, bool):
+            raise ValueError("fit_intercept must be a bool")
         if not math.isfinite(gate_init) or gate_init < 0:
             raise ValueError("gate_init must be non-negative")
         if exogenous_gate_init is None:
@@ -481,6 +507,7 @@ class GSEVARX(nn.Module):
         self.exogenous_layout = exogenous_layout
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
+        self.fit_intercept = fit_intercept
 
         self.endogenous_coeff_net = TargetLagwiseMLP(
             num_lags=order,
@@ -514,10 +541,20 @@ class GSEVARX(nn.Module):
                 float(exogenous_gate_init),
             )
         )
+        self.register_parameter(
+            "intercept", nn.Parameter(torch.zeros(num_endogenous)) if fit_intercept else None
+        )
 
     def reset_parameters(self) -> None:
         self.endogenous_coeff_net.reset_parameters()
         self.exogenous_coeff_net.reset_parameters()
+        if getattr(self, "intercept", None) is not None:
+            with torch.no_grad():
+                self.intercept.zero_()
+
+    def _add_intercept(self, predictions: torch.Tensor) -> torch.Tensor:
+        intercept = getattr(self, "intercept", None)
+        return predictions if intercept is None else predictions + intercept
 
     def _validate_inputs(
         self,
@@ -633,7 +670,7 @@ class GSEVARX(nn.Module):
             exogenous_coefficients,
             exogenous_inputs,
         )
-        return predictions, endogenous_coefficients, exogenous_coefficients
+        return self._add_intercept(predictions), endogenous_coefficients, exogenous_coefficients
 
     def forward_with_jacobians(
         self,
@@ -680,7 +717,7 @@ class GSEVARX(nn.Module):
             exogenous_inputs,
         )
         return (
-            predictions,
+            self._add_intercept(predictions),
             endogenous_coefficients,
             exogenous_coefficients,
             endogenous_jacobian,

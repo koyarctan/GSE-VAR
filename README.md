@@ -5,10 +5,13 @@ exogenous-input extension, **GSE-VARX**. This modular PyTorch implementation
 combines state-dependent coefficients with gated Neural Granger Causality
 (NGC) regularization.
 
-This code is designed around two reference implementations:
+This code is designed around the following reference implementations and methods:
 
 - GVAR: <https://github.com/i6092467/GVAR>
 - Neural-GC: <https://github.com/iancovert/Neural-GC>
+- VARX-L: Sparse Own/Other grouping and an unpenalized prediction intercept
+  (Nicholson, Matteson and Bien, 2017, Table 1, Eq. 7 and Appendix A.2):
+  <https://doi.org/10.1016/j.ijforecast.2017.01.003>
 
 The main adaptation is a learnable non-negative `causal_gate` with shape
 `[lag, target, source]`. For each `(lag, target)` pair, the coefficient network
@@ -58,6 +61,7 @@ result = fit_gse_var(data, config)
 
 print(result.causal_strength)
 print(result.causal_graph)
+print(result.intercept)  # prediction intercept, one value per target
 ```
 
 Example training output:
@@ -68,6 +72,44 @@ Epoch   10/200  | loss=1.38 | mse=1.22 | ngc=0.16 | smooth=0 | jacobian=0 | acti
 ```
 
 ## Sparse Group Lasso
+
+Both GSE-VAR and GSE-VARX default to `regularizer="sparse_group_lasso"`,
+`endogenous_grouping="own_other"`, and `fit_intercept=True`. No additional
+options are needed to activate these defaults. Penalty strengths are still
+chosen by the user; zero strengths do not induce sparsity.
+
+For endogenous gates, the default is the **unweighted Sparse Own/Other**
+grouping adapted from VARX-L. At each lag, all diagonal entries form one own
+group and all off-diagonal entries form another group. With $G_k$ denoting a
+lag gate matrix, the penalty is
+
+$$
+R_y(G)=\lambda_{\mathrm{group}}\sum_k
+\left(\|\operatorname{diag}(G_k)\|_2+
+\|(G_{k,i,j})_{i\ne j}\|_2\right)
++\lambda_{\mathrm{l1}}\sum_{k,i,j}|G_{k,i,j}|.
+$$
+
+The two groups are independently shrunk with the same specified group
+strength. Individual gates can be removed by L1 shrinkage; no own edge is
+forced to remain. There are no `sqrt(group size)` multipliers or separately
+chosen own/other penalty ratios. This adapts the paper's grouping to structural
+gates, rather than reproducing its weighted penalty on linear coefficients.
+This distinction does not confer the paper's convex optimization guarantees
+on the nonlinear model.
+
+GSE-VARX keeps the existing exogenous grouping: all valid lags for each
+`(target, original source)` form one group. Current terms are included when
+specified. It does **not** automatically adopt the paper's grouping across
+all targets at a fixed exogenous source and lag.
+
+Set `endogenous_grouping="edge"` to compare against the original edge-wise
+SGL described below. The grouping option affects endogenous SGL only;
+explicit `group_lasso` and `hierarchical_group_lasso` selections retain their
+existing definitions. Graphs are still aggregated across lags by each
+target-source pair regardless of the optimization grouping.
+
+### Original edge-wise SGL
 
 Neural-GC's cMLP implementation supports a `GSGL` penalty, described in the
 repository as group sparse group lasso. Its proximal update first applies a
@@ -90,7 +132,7 @@ For each edge `source j -> target i`, define:
 g_{i,j} = (G_{1,i,j}, \dots, G_{K,i,j})
 ```
 
-The default NGC regularizer is:
+The edge-wise NGC regularizer (`endogenous_grouping="edge"`) is:
 
 ```math
 R_{\mathrm{SGL}}(G)
@@ -111,10 +153,38 @@ then the non-negative sparse-group proximal operator is applied to
 `causal_gate`:
 
 1. one-sided elementwise thresholding for lag-level sparsity;
-2. group soft-thresholding over all lags for each target-source edge.
+2. group soft-thresholding on each lag's own/other groups by default, or
+   over all lags for each target-source edge in `endogenous_grouping="edge"`.
 
-This preserves non-negativity, can remove individual lag gates, and can also
-remove the entire Granger edge.
+This preserves non-negativity and exact zeros. An edge is absent when all of
+its lag gates are zero, even when the optimization groups are own/other.
+
+## Independent prediction intercept
+
+Both models predict `intercept + sum(coefficients * inputs)`. The intercept
+is a separate, input-independent parameter with one entry per endogenous
+target; it is not a coefficient-network bias, an exogenous column, or a gate.
+Following VARX-L Appendix A.2, it receives no sparsity, smoothness, Jacobian,
+or coefficient-weight-decay penalty. New fitted models initialize it from the
+mean training residual under the initial coefficient networks and then learn
+it jointly with the networks. This is not a claim that the nonlinear fit uses
+the paper's exact linear centering/profile solution at every update.
+
+Only training responses enter initialization. A supplied model's intercept
+is not reinitialized, and VARX early stopping restores it with the complete
+best-epoch state. `result.intercept` returns a copy of the learned vector in
+model-response units, or `None` when disabled. It is excluded from coefficient
+arrays, causal graphs, forests, and coefficient/Jacobian comparisons; its
+input derivative is zero. Consequently, all-zero gates leave the fitted
+constant prediction, not a forced zero prediction.
+
+Use `fit_intercept=False` for an intercept-free comparison. Older intercept-
+free `state_dict`s can be loaded into models constructed with that option;
+the original ungated GVAR baseline remains intercept-free by default. Older
+pickled models also keep their original predictions without injecting a new
+parameter. These new defaults change training conditions: archived notebook
+outputs were not recomputed and do not establish performance for the new
+specification. No random-walk or other reference-model baseline is imposed.
 
 ## Design Notes
 
@@ -252,9 +322,11 @@ config = GSEVARXTrainingConfig(
     max_epochs=2000,
     batch_size=128,
     learning_rate=1e-2,
-    regularizer="hierarchical_group_lasso",
-    lambda_ngc=1e-2,
-    lambda_ngc_exog=5e-3,
+    regularizer="sparse_group_lasso",
+    sparse_group_lambda=1e-2,
+    sparse_l1_lambda=1e-3,
+    sparse_group_lambda_exog=5e-3,
+    sparse_l1_lambda_exog=1e-3,
     lambda_smooth=1e-2,
     lambda_jacobian=10.0,
     coefficient_weight_decay=1e-4,
@@ -267,6 +339,7 @@ result = fit_gse_varx(endog, exog, config)
 print(result.endogenous_graph)  # [endogenous target, endogenous source]
 print(result.exogenous_graph)   # [endogenous target, exogenous source]
 print(result.exogenous_lags)    # [2, 1, 0]
+print(result.intercept)         # [endogenous target]
 ```
 
 The returned coefficient arrays are:
@@ -423,7 +496,8 @@ from gse_var import GSEVARXTrainingConfig, fit_gse_varx
 config = GSEVARXTrainingConfig(
     order=5, hidden_layer_size=100,
     exog_order=0, include_current_exog=True,
-    regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
+    regularizer="sparse_group_lasso",
+    sparse_group_lambda=0.01, sparse_l1_lambda=0.005,
     regularizer_exog="sparse_group_lasso",
     sparse_group_lambda_exog=0.01, sparse_l1_lambda_exog=0.005,
     coefficient_weight_decay=1e-4, optimizer="ista", causal_threshold=0,
@@ -440,9 +514,10 @@ result = fit_gse_varx(
 The weights above are examples, not validated hyperparameters. Each target
 and original source forms its own gate group across **valid** lags. Sparse
 group lasso combines source-level and individual-lag selection. Calendar
-sources receive the same gate regularization as other sources. By default,
-the group term is weighted by `sqrt(number of valid lags)`; set
-`exogenous_group_size_weights=False` for unweighted groups. The nonnegative
+sources receive the same gate regularization as other sources. Group norms
+and hierarchical nested-group norms are unweighted: there is no extra
+`sqrt(group size)` multiplier or group-size-weighting option. Hierarchical
+penalties still penalize distant lags through overlapping nested groups. The nonnegative
 proximal update retains exact zeros with ISTA. Jacobian penalties continue to
 hold both gates fixed. Hierarchical exogenous penalties reject layouts with
 leads: a one-sided lag hierarchy should not silently impose an order on
@@ -727,9 +802,9 @@ $$\Phi_{k,i,:}(u_{k,i,t})=f_{k,i}(u_{k,i,t})$$
 
 最終予測は
 
-$$\hat{x}_{i,t}=\sum_{k=1}^{K}\sum_{j=1}^{p}G_{k,i,j}\Phi_{k,i,j}(G_{k,i,:}\odot x_{t-k})x_{j,t-k}$$
+$$\hat{x}_{i,t}=\nu_i+\sum_{k=1}^{K}\sum_{j=1}^{p}G_{k,i,j}\Phi_{k,i,j}(G_{k,i,:}\odot x_{t-k})x_{j,t-k}$$
 
-である。実装上の形状は次の通り。
+である。$\nu_i$ は入力に依存しない独立した予測切片で、既定では有効。スパース罰則と `coefficient_weight_decay` の対象に含めず、学習入力に対する初期残差の平均から初期化して同時学習する。係数生成ネットワーク内部のバイアスとは別のパラメータである。実装上の形状は次の通り。
 
 ```text
 coeffs.shape      == [batch, lag, target, source]
@@ -838,7 +913,13 @@ relative mode では、係数スケールで正規化する。
 
 #### 8.1 Sparse Group Lasso
 
-Sparse Group Lassoは、edge全体をまとめて削除する圧力と、個別lagを削除する圧力を同時に与える。
+既定は VARX-L の Sparse Own/Other を構造ゲートへ適用した、群サイズ重みなしの SGL である。各ラグの対角成分を自己ラグ群、非対角成分を他変数ラグ群として独立に選択し、L1 項で群内の個別ゲートを選択する。両群の指定強度は同じで、自己エッジを強制的に残す仕様ではない。
+
+$$\mathcal R_y(G)=\lambda_{\mathrm{group}}\sum_k\left(\|\operatorname{diag}(G_k)\|_2+\|(G_{k,i,j})_{i\ne j}\|_2\right)+\lambda_{\mathrm{l1}}\sum_{k,i,j}|G_{k,i,j}|.$$
+
+`endogenous_grouping="edge"` を指定すると、以下の従来の辺単位 SGL に戻る。GSE-VARX の外生側は、元変数・予測対象ごとに有効な全ラグをまとめる従来の SGL を維持する。最適化のグループと、可視化のラグ集約後エッジは区別する。
+
+辺単位の Sparse Group Lasso は、edge全体をまとめて削除する圧力と、個別lagを削除する圧力を同時に与える。
 
 edge `j -> i` に対応するラグ方向のgate vectorを次で定義する。
 
@@ -962,6 +1043,8 @@ G^{(m+1)}
 
 $$Z_{k,i,j}=\max\left(U_{k,i,j}-\eta\lambda_{\mathrm{l1}},0\right)$$
 
+既定の Own/Other では、この後、各ラグの対角群と非対角群それぞれに、しきい値 $\eta\lambda_{\mathrm{group}}$ の group shrinkage を行う。以下は `endogenous_grouping="edge"` の場合の更新である。
+
 次に、各edge `j -> i` のラグベクトル
 
 $$z_{i,j}=(Z_{1,i,j},\ldots,Z_{K,i,j}),\qquad n_{i,j}=\|z_{i,j}\|_2$$
@@ -1077,8 +1160,9 @@ G_{k,i,j}\Phi_{k,i,j}\!\left(G_{k,i,:}\odot x_{t-k}\right)
 
 1. GVARにより、非線形・状態依存的な自己回帰係数を学習する。
 2. `causal_gate` を係数生成器への入力と生成後の係数に適用し、動的係数と静的なGranger構造を分離する。
-3. Sparse Group Lassoにより、edge単位の削除とlag単位の削除を同時に扱う。
+3. 既定の重みなし Sparse Own/Other SGL により、自己ラグと他変数ラグを区別し、L1 項で個別ゲートを選択する。従来の辺単位 SGL は比較用に残す。
 4. Hierarchical Group Lassoにより、ラグ方向の入れ子構造を利用したラグ選択を行う。
 5. ISTAの近接更新により、`causal_gate` に厳密なゼロを生成する。
 6. Granger因果行列は、状態依存係数の事後的な閾値処理ではなく、gate normに基づいて構成する。
 7. 有効係数を見ることで、効果の符号やラグごとの分布も解釈できる。
+8. 独立した無罰則の予測切片を持つため、ゲートが全てゼロでも学習された定数予測を維持する。切片は因果エッジには含めない。

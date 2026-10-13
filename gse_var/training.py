@@ -11,7 +11,10 @@ from torch import nn
 
 from .data import LaggedDataset, construct_lagged_dataset
 from .models import AggregationName, GSEVAR
-from .regularizers import NGCRegularizer, RegularizerName
+from .regularizers import (
+    EndogenousGroupingName, NGCRegularizer, OwnOtherSparseGroupRegularizer,
+    RegularizerName,
+)
 
 OptimizerName = Literal["adam", "ista"]
 SmoothnessMode = Literal["absolute", "relative"]
@@ -19,6 +22,12 @@ SmoothnessMode = Literal["absolute", "relative"]
 
 @dataclass(frozen=True)
 class GSEVARTrainingConfig:
+    """Sparse Own/Other SGL and an unpenalized intercept are the defaults.
+
+    ``endogenous_grouping`` affects SGL only; ``edge`` restores the original
+    per-(target, source) lag groups. Explicit GL/HGL selections are unchanged.
+    Penalty strengths are still user-supplied, not data-tuned defaults.
+    """
     order: int
     hidden_layer_size: int
     num_hidden_layers: int = 1
@@ -43,6 +52,8 @@ class GSEVARTrainingConfig:
     verbose: int = 1
     log_every: int = 10
     device: str | torch.device | None = None
+    endogenous_grouping: EndogenousGroupingName = "own_other"
+    fit_intercept: bool = True
 
 
 @dataclass
@@ -53,6 +64,11 @@ class GSEVARFitResult:
     causal_strength: np.ndarray | None = None
     causal_graph: np.ndarray | None = None
     causal_threshold: float = 0.0
+
+    @property
+    def intercept(self) -> np.ndarray | None:
+        parameter = getattr(self.model, "intercept", None)
+        return None if parameter is None else parameter.detach().cpu().numpy().copy()
 
 
 @dataclass(frozen=True)
@@ -70,6 +86,10 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
 
 
 def _validate_config(config: GSEVARTrainingConfig) -> None:
+    if config.endogenous_grouping not in ("own_other", "edge"):
+        raise ValueError("endogenous_grouping must be 'own_other' or 'edge'")
+    if not isinstance(config.fit_intercept, bool):
+        raise ValueError("fit_intercept must be a bool")
     if config.lambda_ngc < 0:
         raise ValueError("lambda_ngc must be non-negative")
     if config.sparse_group_lambda < 0:
@@ -100,11 +120,14 @@ def _make_optimizer(
 ) -> torch.optim.Optimizer:
     gate_params = []
     coeff_params = []
+    intercept_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if name == "causal_gate":
             gate_params.append(param)
+        elif name == "intercept":
+            intercept_params.append(param)
         else:
             coeff_params.append(param)
 
@@ -114,12 +137,54 @@ def _make_optimizer(
             "weight_decay": config.coefficient_weight_decay,
         },
         {"params": gate_params, "weight_decay": 0.0},
+        {"params": intercept_params, "weight_decay": 0.0},
     ]
     if config.optimizer == "adam":
         return torch.optim.Adam(param_groups, lr=config.learning_rate)
     if config.optimizer == "ista":
         return torch.optim.SGD(param_groups, lr=config.learning_rate)
     raise ValueError(f"unsupported optimizer: {config.optimizer}")
+
+
+def _make_endogenous_regularizer(
+    config: GSEVARTrainingConfig,
+) -> NGCRegularizer | OwnOtherSparseGroupRegularizer:
+    if config.regularizer == "sparse_group_lasso" and config.endogenous_grouping == "own_other":
+        return OwnOtherSparseGroupRegularizer(
+            sparse_l1_lambda=config.sparse_l1_lambda,
+            sparse_group_lambda=config.sparse_group_lambda,
+        )
+    return NGCRegularizer(
+        name=config.regularizer, lam=config.lambda_ngc, reduction="sum", lag_dim=0,
+        sparse_l1_lambda=config.sparse_l1_lambda,
+        sparse_group_lambda=config.sparse_group_lambda,
+    )
+
+
+@torch.no_grad()
+def _initialize_intercept(model, predictors, responses, batch_size):
+    """Initialize only a newly created model from TRAIN residual means.
+
+    VARX-L Appendix A.2 profiles an unpenalized intercept as mean residuals.
+    Here this initializes an independent parameter, subsequently learned
+    jointly with the nonlinear coefficient generators. No validation/test
+    responses are used and supplied models are never reinitialized.
+    """
+    intercept = getattr(model, "intercept", None)
+    if intercept is None:
+        return
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    was_training = model.training
+    model.eval()
+    try:
+        residual_sum = responses.sum(dim=0, dtype=torch.float64)
+        for start in range(0, len(responses), batch_size):
+            prediction = model(*(values[start:start + batch_size] for values in predictors))[0]
+            residual_sum -= prediction.sum(dim=0, dtype=torch.float64)
+        intercept.add_((residual_sum / len(responses)).to(intercept.dtype))
+    finally:
+        model.train(was_training)
 
 
 def _to_torch_dataset(
@@ -206,7 +271,7 @@ def _epoch(
     dataset: _TorchLaggedDataset,
     config: GSEVARTrainingConfig,
     optimizer: torch.optim.Optimizer | None,
-    ngc: NGCRegularizer,
+    ngc: NGCRegularizer | OwnOtherSparseGroupRegularizer,
     criterion: nn.Module,
     device: torch.device,
     rng: np.random.Generator,
@@ -401,7 +466,8 @@ def fit_gse_var(
     device = _resolve_device(config.device)
     num_vars = dataset_np.predictors.shape[-1]
 
-    if model is None:
+    new_model = model is None
+    if new_model:
         model = GSEVAR(
             num_vars=num_vars,
             order=config.order,
@@ -409,6 +475,7 @@ def fit_gse_var(
             num_hidden_layers=config.num_hidden_layers,
             use_causal_gate=True,
             gate_init=config.gate_init,
+            fit_intercept=config.fit_intercept,
         )
     model.to(device)
 
@@ -422,18 +489,13 @@ def fit_gse_var(
         raise ValueError(
             f"model num_vars {model.num_vars} does not match data num_vars {num_vars}"
         )
+    if (getattr(model, "intercept", None) is not None) != config.fit_intercept:
+        raise ValueError("model fit_intercept does not match config fit_intercept")
     # A caller may pass a manually modified model. Project before the first
     # forward pass so negative gates can never alter input signs.
     model.project_causal_gate_()
 
-    ngc = NGCRegularizer(
-        name=config.regularizer,
-        lam=config.lambda_ngc,
-        reduction="sum",
-        lag_dim=0,
-        sparse_l1_lambda=config.sparse_l1_lambda,
-        sparse_group_lambda=config.sparse_group_lambda,
-    )
+    ngc = _make_endogenous_regularizer(config)
     optimizer = _make_optimizer(config, model)
     criterion = nn.MSELoss(reduction="mean")
     rng = np.random.default_rng(config.seed)
@@ -445,6 +507,8 @@ def fit_gse_var(
         "jacobian": [],
     }
     dataset = _to_torch_dataset(dataset_np, device)
+    if new_model:
+        _initialize_intercept(model, (dataset.predictors,), dataset.responses, config.batch_size)
 
     for epoch in range(1, config.max_epochs + 1):
         metrics = _epoch(

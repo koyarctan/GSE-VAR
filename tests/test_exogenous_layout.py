@@ -11,7 +11,10 @@ from gse_var import (
     construct_varx_lagged_dataset, fit_gse_varx, evaluate_coefficients,
     causal_gate_matrices,
 )
-from gse_var.regularizers import ExogenousGroupRegularizer
+from gse_var.regularizers import (
+    ExogenousGroupRegularizer,
+    prox_nonnegative_hierarchical_group_lasso_,
+)
 
 
 def layout():
@@ -87,21 +90,19 @@ def test_expanded_inputs_not_shifted_twice_and_blocks_not_crossed():
         construct_varx_lagged_dataset(y, x, order=2, exog_order=1, exog_features=layout())
 
 
-@pytest.mark.parametrize("size_weights", [False, True])
-def test_group_penalty_and_nonnegative_prox_match_closed_form(size_weights):
+def test_group_penalty_and_nonnegative_prox_match_closed_form():
     spec = layout()
     values = torch.tensor([[[0.4, 0.3, -0.2, 0.8, 0.1, 0.01],
                             [0.01, 0.02, 0.5, 0.3, 0.4, 0.7]]], dtype=torch.float64)
     reg = ExogenousGroupRegularizer(spec, sparse_group_lambda=0.2,
-                                    sparse_l1_lambda=0.1, size_weights=size_weights)
+                                    sparse_l1_lambda=0.1)
     expected_penalty = 0.1 * values.abs().sum()
     expected_prox = values.clone()
     for group in spec.groups:
-        weight = len(group)**0.5 if size_weights else 1.0
-        expected_penalty += 0.2 * weight * torch.linalg.vector_norm(values[0, :, group], dim=-1).sum()
+        expected_penalty += 0.2 * torch.linalg.vector_norm(values[0, :, group], dim=-1).sum()
         block = (values[0, :, group] - 0.1).clamp(min=0)
         norm = torch.linalg.vector_norm(block, dim=-1, keepdim=True)
-        expected_prox[0, :, group] = block * (1 - 0.2 * weight / norm.clamp(min=1e-12)).clamp(min=0)
+        expected_prox[0, :, group] = block * (1 - 0.2 / norm.clamp(min=1e-12)).clamp(min=0)
     torch.testing.assert_close(reg.penalty(values), expected_penalty)
     got = values.clone()
     reg.prox_(got, 1.0, nonnegative=True)
@@ -113,6 +114,66 @@ def test_group_penalty_and_nonnegative_prox_match_closed_form(size_weights):
 def test_regularizer_rejects_arbitrary_lead_hierarchy():
     with pytest.raises(ValueError, match="leads"):
         ExogenousGroupRegularizer(layout(), name="hierarchical_group_lasso", lam=0.1)
+
+
+def test_group_prox_treats_equal_norm_sources_equally_with_different_lag_counts():
+    spec = ExogenousLayout(tuple(ExogenousFeature("promo", lag) for lag in (0, 1, 2)) +
+                            (ExogenousFeature("holiday", 0),))
+    reg = ExogenousGroupRegularizer(spec, name="group_lasso", lam=0.4)
+    gate = torch.tensor([[[0.6, 0.8, 0.0, 1.0]]], dtype=torch.float64)
+    torch.testing.assert_close(reg.penalty(gate), gate.new_tensor(0.8))
+    reg.prox_(gate, 1.0, nonnegative=True)
+    torch.testing.assert_close(gate, gate.new_tensor([[[0.36, 0.48, 0.0, 0.6]]]))
+
+
+def test_hierarchical_penalty_and_prox_are_unweighted_for_variable_lags():
+    # Deliberately interleave sources and lag order in the packed columns.
+    spec = ExogenousLayout((ExogenousFeature("promo", 0), ExogenousFeature("oil", 3),
+                            ExogenousFeature("promo", 2), ExogenousFeature("holiday", 0),
+                            ExogenousFeature("oil", 1), ExogenousFeature("promo", 1)))
+    values = torch.tensor([[[0.4, 0.03, -0.2, 0.01, 0.5, 0.3],
+                            [0.1, 0.8, 0.2, 0.7, 0.4, 0.01],
+                            [0.6, 0.4, 0.8, -0.2, 0.3, 0.5]]], dtype=torch.float64)
+    reg = ExogenousGroupRegularizer(spec, name="hierarchical_group_lasso", lam=0.4)
+    gate = values[0]
+    expected_penalty = 0.4 * (
+        gate[:, 2].abs().sum()
+        + gate[:, [2, 5]].norm(dim=-1).sum()
+        + gate[:, [2, 5, 0]].norm(dim=-1).sum()
+        + gate[:, 1].abs().sum()
+        + gate[:, [1, 4]].norm(dim=-1).sum()
+        + gate[:, 3].abs().sum()
+    )
+    torch.testing.assert_close(reg.penalty(values), expected_penalty)
+    expected_prox = values.clone()
+    for indices in ([2, 5, 0], [1, 4], [3]):
+        # The existing endogenous HGL is the unweighted reference operator.
+        block = values[0, :, indices].T.unsqueeze(-1).clone()
+        prox_nonnegative_hierarchical_group_lasso_(block, 0.4, 0.5)
+        expected_prox[0, :, indices] = block[..., 0].T
+    got = values.clone()
+    reg.prox_(got, 0.5, nonnegative=True)
+    torch.testing.assert_close(got, expected_prox)
+    assert got[0, 0, 3].item() == 0
+
+
+@pytest.mark.parametrize("name", ["group_lasso", "hierarchical_group_lasso", "sparse_group_lasso"])
+def test_single_lag_source_has_no_size_multiplier(name):
+    spec = ExogenousLayout((ExogenousFeature("holiday", 0),))
+    kwargs = (dict(sparse_group_lambda=0.2, sparse_l1_lambda=0.1)
+              if name == "sparse_group_lasso" else dict(lam=0.3))
+    reg = ExogenousGroupRegularizer(spec, name=name, **kwargs)
+    gate = torch.tensor([[[0.1], [0.4]]], dtype=torch.float64)
+    torch.testing.assert_close(reg.penalty(gate), gate.new_tensor(0.15))
+    reg.prox_(gate, 0.5, nonnegative=True)
+    torch.testing.assert_close(gate, gate.new_tensor([[[0.0], [0.25]]]))
+
+
+def test_group_size_weighting_options_are_removed():
+    with pytest.raises(TypeError, match="size_weights"):
+        ExogenousGroupRegularizer(layout(), size_weights=True)
+    with pytest.raises(TypeError, match="exogenous_group_size_weights"):
+        GSEVARXTrainingConfig(exogenous_group_size_weights=True)
 
 
 def test_aggregate_then_threshold_not_threshold_then_or():
@@ -181,7 +242,7 @@ def test_evaluation_reads_only_predictors_and_restores_model_state():
 def test_three_targets_and_five_lags_group_prox_preserves_axes():
     spec = ExogenousLayout(tuple(ExogenousFeature("x", k) for k in range(5)) +
                             (ExogenousFeature("z", 0),))
-    reg = ExogenousGroupRegularizer(spec, name="group_lasso", lam=0.4, size_weights=False)
+    reg = ExogenousGroupRegularizer(spec, name="group_lasso", lam=0.4)
     gate = torch.arange(18, dtype=torch.float64).reshape(1, 3, 6) / 10
     expected = gate.clone()
     for row in range(3):

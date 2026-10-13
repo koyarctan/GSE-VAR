@@ -11,11 +11,16 @@ from torch import nn
 
 from .data import VARXLaggedDataset, construct_varx_lagged_dataset
 from .models import GSEVARX
-from .regularizers import ExogenousGroupRegularizer, NGCRegularizer, RegularizerName
+from .regularizers import (
+    ExogenousGroupRegularizer, NGCRegularizer, OwnOtherSparseGroupRegularizer,
+    RegularizerName,
+)
 from .exogenous import ExogenousLayout
 from .training import (
     GSEVARTrainingConfig,
     _iter_batches,
+    _initialize_intercept,
+    _make_endogenous_regularizer,
     _resolve_device,
     _validate_config,
     temporal_smoothness_penalty,
@@ -42,7 +47,6 @@ class GSEVARXTrainingConfig(GSEVARTrainingConfig):
     sparse_l1_lambda_exog: float | None = None
     exogenous_gate_init: float | None = None
     regularizer_exog: RegularizerName | None = None
-    exogenous_group_size_weights: bool = True
     early_stopping: bool = False
     early_stopping_patience: int = 100
     early_stopping_min_delta: float = 0.0
@@ -69,6 +73,11 @@ class GSEVARXFitResult:
     epochs_trained: int = 0
     early_stopped: bool = False
     stopped_epoch: int | None = None
+
+    @property
+    def intercept(self) -> np.ndarray | None:
+        parameter = getattr(self.model, "intercept", None)
+        return None if parameter is None else parameter.detach().cpu().numpy().copy()
 
     @property
     def exogenous_source_names(self):
@@ -225,11 +234,14 @@ def _make_optimizer(
 ) -> torch.optim.Optimizer:
     gate_parameters = []
     coefficient_parameters = []
+    intercept_parameters = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if name in ("endogenous_gate", "exogenous_gate"):
             gate_parameters.append(parameter)
+        elif name == "intercept":
+            intercept_parameters.append(parameter)
         else:
             coefficient_parameters.append(parameter)
 
@@ -239,6 +251,7 @@ def _make_optimizer(
             "weight_decay": config.coefficient_weight_decay,
         },
         {"params": gate_parameters, "weight_decay": 0.0},
+        {"params": intercept_parameters, "weight_decay": 0.0},
     ]
     if config.optimizer == "adam":
         return torch.optim.Adam(
@@ -329,20 +342,16 @@ def _validation_mse(
 def _make_regularizers(
     config: GSEVARXTrainingConfig,
     layout: ExogenousLayout | None = None,
-) -> tuple[NGCRegularizer, NGCRegularizer]:
-    endogenous_regularizer = NGCRegularizer(
-        name=config.regularizer,
-        lam=config.lambda_ngc,
-        reduction="sum",
-        lag_dim=0,
-        sparse_l1_lambda=config.sparse_l1_lambda,
-        sparse_group_lambda=config.sparse_group_lambda,
-    )
+) -> tuple[
+    NGCRegularizer | OwnOtherSparseGroupRegularizer,
+    NGCRegularizer | ExogenousGroupRegularizer,
+]:
+    endogenous_regularizer = _make_endogenous_regularizer(config)
     exogenous_kwargs = _exogenous_regularizer_kwargs(config)
     exogenous_regularizer = (
         NGCRegularizer(**exogenous_kwargs, reduction="sum", lag_dim=0)
         if layout is None else ExogenousGroupRegularizer(
-            **exogenous_kwargs, layout=layout, size_weights=config.exogenous_group_size_weights
+            **exogenous_kwargs, layout=layout
         )
     )
     return endogenous_regularizer, exogenous_regularizer
@@ -353,8 +362,8 @@ def _epoch(
     dataset: _TorchVARXLaggedDataset,
     config: GSEVARXTrainingConfig,
     optimizer: torch.optim.Optimizer,
-    endogenous_regularizer: NGCRegularizer,
-    exogenous_regularizer: NGCRegularizer,
+    endogenous_regularizer: NGCRegularizer | OwnOtherSparseGroupRegularizer,
+    exogenous_regularizer: NGCRegularizer | ExogenousGroupRegularizer,
     criterion: nn.Module,
     device: torch.device,
     rng: np.random.Generator,
@@ -680,7 +689,8 @@ def fit_gse_varx(
     num_endogenous = dataset.endogenous_predictors.shape[-1]
     num_exogenous = dataset.exogenous_predictors.shape[-1]
 
-    if model is None:
+    new_model = model is None
+    if new_model:
         model = GSEVARX(
             num_endogenous=num_endogenous,
             num_exogenous=num_exogenous,
@@ -692,6 +702,7 @@ def fit_gse_varx(
             gate_init=config.gate_init,
             exogenous_gate_init=config.exogenous_gate_init,
             exogenous_layout=dataset_np.exogenous_layout,
+            fit_intercept=config.fit_intercept,
         )
     if model.num_endogenous != num_endogenous:
         raise ValueError(
@@ -703,6 +714,8 @@ def fit_gse_varx(
         )
     if model.order != config.order:
         raise ValueError("model order does not match config order")
+    if (getattr(model, "intercept", None) is not None) != config.fit_intercept:
+        raise ValueError("model fit_intercept does not match config fit_intercept")
     if model.exogenous_layout != dataset_np.exogenous_layout:
         raise ValueError("model exogenous identities do not match the dataset layout")
     if endog_names is not None and len(endog_names) != num_endogenous:
@@ -717,6 +730,11 @@ def fit_gse_varx(
 
     model.to(device)
     model.project_causal_gates_()
+    if new_model:
+        _initialize_intercept(
+            model, (dataset.endogenous_predictors, dataset.exogenous_predictors),
+            dataset.responses, config.batch_size,
+        )
     endogenous_regularizer, exogenous_regularizer = _make_regularizers(config, dataset_np.exogenous_layout)
     optimizer = _make_optimizer(config, model)
     criterion = nn.MSELoss(reduction="mean")
