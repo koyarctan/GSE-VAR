@@ -118,13 +118,23 @@ def _make_optimizer(
     config: GSEVARTrainingConfig,
     model: nn.Module,
 ) -> torch.optim.Optimizer:
+    return _make_gated_optimizer(config, model, gate_names=("causal_gate",))
+
+
+def _make_gated_optimizer(
+    config: GSEVARTrainingConfig,
+    model: nn.Module,
+    *,
+    gate_names: tuple[str, ...],
+) -> torch.optim.Optimizer:
+    """Share decay policy while preserving parameter and optimizer-state order."""
     gate_params = []
     coeff_params = []
     intercept_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name == "causal_gate":
+        if name in gate_names:
             gate_params.append(param)
         elif name == "intercept":
             intercept_params.append(param)

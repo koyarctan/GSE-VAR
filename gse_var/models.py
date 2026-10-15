@@ -167,6 +167,31 @@ class TargetLagwiseMLP(nn.Module):
         return activations
 
 
+def _prediction_jacobian_components(
+    raw_coefficients: torch.Tensor,
+    coefficients: torch.Tensor,
+    coefficient_inputs: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Contract the target/lag-local coefficient derivative into ``J - C``.
+
+    Callers construct the gated inputs and enable gradients. Keeping their
+    graph construction separate preserves the VAR and VARX gate paths.
+    """
+    contracted_derivative = torch.autograd.grad(
+        outputs=raw_coefficients,
+        inputs=coefficient_inputs,
+        grad_outputs=coefficient_inputs,
+        create_graph=create_graph,
+        retain_graph=create_graph,
+    )[0]
+    mismatch = contracted_derivative * gate.unsqueeze(0)
+    jacobian = coefficients + mismatch
+    return coefficients, jacobian, mismatch
+
+
 class GSEVAR(nn.Module):
     """GSE-VAR: gated self-explaining vector autoregression.
 
@@ -360,15 +385,13 @@ class GSEVAR(nn.Module):
                 raise RuntimeError(
                     "Jacobian shortcut requires gated coefficient inputs"
                 )
-            contracted_derivative = torch.autograd.grad(
-                outputs=raw_coeffs,
-                inputs=coefficient_inputs,
-                grad_outputs=coefficient_inputs,
+            coeffs, jacobian, mismatch = _prediction_jacobian_components(
+                raw_coeffs,
+                coeffs,
+                coefficient_inputs,
+                causal_gate,
                 create_graph=create_graph,
-                retain_graph=create_graph,
-            )[0]
-            mismatch = contracted_derivative * causal_gate.unsqueeze(0)
-            jacobian = coeffs + mismatch
+            )
 
         return coeffs, jacobian, mismatch
 
@@ -644,15 +667,13 @@ class GSEVARX(nn.Module):
                     require_input_grad=True,
                 )
             )
-            contracted_derivative = torch.autograd.grad(
-                outputs=raw,
-                inputs=coefficient_inputs,
-                grad_outputs=coefficient_inputs,
+            coefficients, jacobian, mismatch = _prediction_jacobian_components(
+                raw,
+                coefficients,
+                coefficient_inputs,
+                gate,
                 create_graph=create_graph,
-                retain_graph=create_graph,
-            )[0]
-            mismatch = contracted_derivative * gate.unsqueeze(0)
-            jacobian = coefficients + mismatch
+            )
         return coefficients, jacobian, mismatch
 
     def forward(

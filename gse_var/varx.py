@@ -20,6 +20,7 @@ from .training import (
     GSEVARTrainingConfig,
     _iter_batches,
     _make_endogenous_regularizer,
+    _make_gated_optimizer,
     _resolve_device,
     _validate_config,
     temporal_smoothness_penalty,
@@ -231,38 +232,9 @@ def _make_optimizer(
     config: GSEVARXTrainingConfig,
     model: GSEVARX,
 ) -> torch.optim.Optimizer:
-    gate_parameters = []
-    coefficient_parameters = []
-    intercept_parameters = []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if name in ("endogenous_gate", "exogenous_gate"):
-            gate_parameters.append(parameter)
-        elif name == "intercept":
-            intercept_parameters.append(parameter)
-        else:
-            coefficient_parameters.append(parameter)
-
-    parameter_groups = [
-        {
-            "params": coefficient_parameters,
-            "weight_decay": config.coefficient_weight_decay,
-        },
-        {"params": gate_parameters, "weight_decay": 0.0},
-        {"params": intercept_parameters, "weight_decay": 0.0},
-    ]
-    if config.optimizer == "adam":
-        return torch.optim.Adam(
-            parameter_groups,
-            lr=config.learning_rate,
-        )
-    if config.optimizer == "ista":
-        return torch.optim.SGD(
-            parameter_groups,
-            lr=config.learning_rate,
-        )
-    raise ValueError(f"unsupported optimizer: {config.optimizer}")
+    return _make_gated_optimizer(
+        config, model, gate_names=("endogenous_gate", "exogenous_gate"),
+    )
 
 
 def _prepare_validation_dataset(
