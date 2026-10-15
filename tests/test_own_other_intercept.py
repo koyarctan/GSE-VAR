@@ -183,10 +183,11 @@ def test_intercept_is_optimized_without_weight_decay(varx, optimizer_name):
 
 @pytest.mark.parametrize("varx", [False, True])
 @pytest.mark.parametrize("optimizer", ["ista", "adam"])
-def test_zero_gate_fit_learns_unpenalized_intercept_from_zero(varx, optimizer):
+def test_intercept_first_update_uses_training_residuals_from_zero(varx, optimizer):
     rng = np.random.default_rng(32)
-    # Strong proximal penalties keep all gates zero. The intercept must learn
-    # the constant response rather than being initialized from its mean.
+    # The first residual is the response because both gates and intercept
+    # start at zero. ISTA keeps gates zero through its proximal step; Adam
+    # can revive them because the sparsity gradient at exactly zero is zero.
     y = np.tile(np.array([[4.0, -2.0]]), (18, 1))
     x = rng.normal(size=(18, 3))
     config_type = GSEVARXTrainingConfig if varx else GSEVARTrainingConfig
@@ -201,18 +202,21 @@ def test_zero_gate_fit_learns_unpenalized_intercept_from_zero(varx, optimizer):
         data = construct_varx_lagged_dataset(y, x, order=2)
         args = (torch.as_tensor(data.endogenous_predictors),
                 torch.as_tensor(data.exogenous_predictors))
-        assert result.endogenous_graph.sum() == result.exogenous_graph.sum() == 0
+        if optimizer == "ista":
+            assert result.endogenous_graph.sum() == result.exogenous_graph.sum() == 0
     else:
         result = fit_gse_var(y, config)
         data = construct_lagged_dataset(y, order=2)
         args = (torch.as_tensor(data.predictors),)
-        assert result.causal_graph.sum() == 0
+        if optimizer == "ista":
+            assert result.causal_graph.sum() == 0
     gradient = -2 * data.responses.mean(axis=0) / data.responses.shape[1]
     expected = (-config.learning_rate * gradient if optimizer == "ista" else
                 -config.learning_rate * gradient / (np.abs(gradient) + 1e-8))
     np.testing.assert_allclose(result.intercept, expected, atol=1e-5)
-    prediction = result.model(*args)[0].detach().numpy()
-    np.testing.assert_allclose(prediction, np.broadcast_to(expected, prediction.shape), atol=1e-5)
+    if optimizer == "ista":
+        prediction = result.model(*args)[0].detach().numpy()
+        np.testing.assert_allclose(prediction, np.broadcast_to(expected, prediction.shape), atol=1e-5)
     copied = result.intercept
     copied[:] = 0
     np.testing.assert_allclose(result.intercept, expected, atol=1e-5)

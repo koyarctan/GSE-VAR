@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -129,7 +131,6 @@ def test_supplied_model_is_not_reinitialized(varx):
                          verbose=0, device="cpu")
     y, x = rng.normal(size=(9, 3)), rng.normal(size=(9, 2))
     if varx:
-        from dataclasses import replace
         config = replace(config, exog_order=2)
         result = fit_gse_varx(y, x, config, model=model)
     else:
