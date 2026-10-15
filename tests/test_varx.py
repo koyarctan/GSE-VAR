@@ -13,7 +13,7 @@ from gse_var import (
 
 
 def _make_model():
-    return GSEVARX(
+    model = GSEVARX(
         num_endogenous=2,
         num_exogenous=3,
         order=2,
@@ -22,6 +22,11 @@ def _make_model():
         hidden_layer_size=5,
         num_hidden_layers=2,
     ).double()
+    # Gradient tests must also cover nonlinear coefficients after initialization.
+    with torch.no_grad():
+        model.endogenous_coeff_net.weights[-1].normal_(std=0.1)
+        model.exogenous_coeff_net.weights[-1].normal_(std=0.1)
+    return model
 
 
 def test_varx_forward_and_fast_jacobians_match_explicit_autograd():

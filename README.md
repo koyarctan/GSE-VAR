@@ -159,19 +159,28 @@ then the non-negative sparse-group proximal operator is applied to
 This preserves non-negativity and exact zeros. An edge is absent when all of
 its lag gates are zero, even when the optimization groups are own/other.
 
+## Default initialization
+
+With the default `gate_init=1.0`, GSE-VAR and GSE-VARX initially predict the
+most recent endogenous observation. The coefficient-network output weights
+start at zero; output biases are zero except for the diagonal of the most
+recent endogenous lag, which is one. Exogenous coefficients and the prediction
+intercept start at zero. Hidden layers retain Xavier initialization. All
+parameters remain trainable; self-edges are not protected from regularization.
+No initialization option is required. The ungated GVAR baseline is unchanged.
+
 ## Independent prediction intercept
 
 Both models predict `intercept + sum(coefficients * inputs)`. The intercept
 is a separate, input-independent parameter with one entry per endogenous
 target; it is not a coefficient-network bias, an exogenous column, or a gate.
 Following VARX-L Appendix A.2, it receives no sparsity, smoothness, Jacobian,
-or coefficient-weight-decay penalty. New fitted models initialize it from the
-mean training residual under the initial coefficient networks and then learn
-it jointly with the networks. This is not a claim that the nonlinear fit uses
-the paper's exact linear centering/profile solution at every update.
+or coefficient-weight-decay penalty. New fitted models start it at zero and
+learn it jointly with the networks. This is not a claim that the nonlinear fit
+uses the paper's exact linear centering/profile solution at every update.
 
-Only training responses enter initialization. A supplied model's intercept
-is not reinitialized, and VARX early stopping restores it with the complete
+Initialization does not use response statistics. A supplied model is not
+reinitialized, and VARX early stopping restores the intercept with the complete
 best-epoch state. `result.intercept` returns a copy of the learned vector in
 model-response units, or `None` when disabled. It is excluded from coefficient
 arrays, causal graphs, forests, and coefficient/Jacobian comparisons; its
@@ -184,7 +193,8 @@ the original ungated GVAR baseline remains intercept-free by default. Older
 pickled models also keep their original predictions without injecting a new
 parameter. These new defaults change training conditions: archived notebook
 outputs were not recomputed and do not establish performance for the new
-specification. No random-walk or other reference-model baseline is imposed.
+specification. The persistence predictor is only the starting point, not a
+fixed forecasting constraint.
 
 ## Design Notes
 
@@ -804,7 +814,7 @@ $$\Phi_{k,i,:}(u_{k,i,t})=f_{k,i}(u_{k,i,t})$$
 
 $$\hat{x}_{i,t}=\nu_i+\sum_{k=1}^{K}\sum_{j=1}^{p}G_{k,i,j}\Phi_{k,i,j}(G_{k,i,:}\odot x_{t-k})x_{j,t-k}$$
 
-である。$\nu_i$ は入力に依存しない独立した予測切片で、既定では有効。スパース罰則と `coefficient_weight_decay` の対象に含めず、学習入力に対する初期残差の平均から初期化して同時学習する。係数生成ネットワーク内部のバイアスとは別のパラメータである。実装上の形状は次の通り。
+である。$\nu_i$ は入力に依存しない独立した予測切片で、既定では有効。スパース罰則と `coefficient_weight_decay` の対象に含めず、0から同時学習する。係数生成ネットワーク内部のバイアスとは別のパラメータである。実装上の形状は次の通り。
 
 ```text
 coeffs.shape      == [batch, lag, target, source]

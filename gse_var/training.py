@@ -161,32 +161,6 @@ def _make_endogenous_regularizer(
     )
 
 
-@torch.no_grad()
-def _initialize_intercept(model, predictors, responses, batch_size):
-    """Initialize only a newly created model from TRAIN residual means.
-
-    VARX-L Appendix A.2 profiles an unpenalized intercept as mean residuals.
-    Here this initializes an independent parameter, subsequently learned
-    jointly with the nonlinear coefficient generators. No validation/test
-    responses are used and supplied models are never reinitialized.
-    """
-    intercept = getattr(model, "intercept", None)
-    if intercept is None:
-        return
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    was_training = model.training
-    model.eval()
-    try:
-        residual_sum = responses.sum(dim=0, dtype=torch.float64)
-        for start in range(0, len(responses), batch_size):
-            prediction = model(*(values[start:start + batch_size] for values in predictors))[0]
-            residual_sum -= prediction.sum(dim=0, dtype=torch.float64)
-        intercept.add_((residual_sum / len(responses)).to(intercept.dtype))
-    finally:
-        model.train(was_training)
-
-
 def _to_torch_dataset(
     dataset: LaggedDataset,
     device: torch.device,
@@ -466,8 +440,7 @@ def fit_gse_var(
     device = _resolve_device(config.device)
     num_vars = dataset_np.predictors.shape[-1]
 
-    new_model = model is None
-    if new_model:
+    if model is None:
         model = GSEVAR(
             num_vars=num_vars,
             order=config.order,
@@ -507,8 +480,6 @@ def fit_gse_var(
         "jacobian": [],
     }
     dataset = _to_torch_dataset(dataset_np, device)
-    if new_model:
-        _initialize_intercept(model, (dataset.predictors,), dataset.responses, config.batch_size)
 
     for epoch in range(1, config.max_epochs + 1):
         metrics = _epoch(

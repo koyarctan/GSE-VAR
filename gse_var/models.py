@@ -75,6 +75,9 @@ class TargetLagwiseMLP(nn.Module):
     Inputs and outputs have shape ``[batch, lag, target, feature]``.  The
     target axis is never mixed, which is essential when every target uses a
     different structural input mask.
+
+    Hidden layers use Xavier initialization; the output layer starts at zero.
+    The owning model sets the most recent endogenous diagonal to one.
     """
 
     def __init__(
@@ -129,11 +132,13 @@ class TargetLagwiseMLP(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for weight, bias in zip(self.weights, self.biases):
+        for weight, bias in zip(self.weights[:-1], self.biases[:-1]):
             for lag_idx in range(self.num_lags):
                 for target_idx in range(self.num_targets):
                     nn.init.xavier_normal_(weight[lag_idx, target_idx])
             nn.init.constant_(bias, 0.1)
+        nn.init.zeros_(self.weights[-1])
+        nn.init.zeros_(self.biases[-1])
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim != 4:
@@ -177,6 +182,8 @@ class GSEVAR(nn.Module):
 
     Gated models have a separate, input-independent prediction intercept by
     default. It is not part of the coefficient tensor or the causal graph.
+    With the default unit gates, initial predictions copy the most recent
+    observation: only that lag's coefficient diagonal starts at one.
     """
 
     def __init__(
@@ -224,6 +231,7 @@ class GSEVAR(nn.Module):
                 output_dim=num_vars,
                 num_hidden_layers=num_hidden_layers,
             )
+            nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
         else:
             # Preserve the original ungated GVAR baseline architecture and its
             # checkpoint/parameter shapes.
@@ -250,6 +258,8 @@ class GSEVAR(nn.Module):
 
     def reset_parameters(self) -> None:
         self.coeff_net.reset_parameters()
+        if self.causal_gate is not None:
+            nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
         if getattr(self, "intercept", None) is not None:
             with torch.no_grad():
                 self.intercept.zero_()
@@ -451,6 +461,8 @@ class GSEVARX(nn.Module):
     Coefficients and gates have layouts ``[batch, lag, target, source]`` and
     ``[lag, target, source]`` respectively. The target dimension is always the
     number of endogenous variables; source dimensions can differ by branch.
+    Initial coefficients copy the most recent endogenous observation under
+    unit gates, with zero exogenous coefficients and a zero intercept.
     """
 
     def __init__(
@@ -525,6 +537,7 @@ class GSEVARX(nn.Module):
             output_dim=num_exogenous,
             num_hidden_layers=num_hidden_layers,
         )
+        nn.init.ones_(self.endogenous_coeff_net.biases[-1][-1].diagonal())
         self.endogenous_gate = nn.Parameter(
             torch.full(
                 (order, num_endogenous, num_endogenous),
@@ -548,6 +561,7 @@ class GSEVARX(nn.Module):
     def reset_parameters(self) -> None:
         self.endogenous_coeff_net.reset_parameters()
         self.exogenous_coeff_net.reset_parameters()
+        nn.init.ones_(self.endogenous_coeff_net.biases[-1][-1].diagonal())
         if getattr(self, "intercept", None) is not None:
             with torch.no_grad():
                 self.intercept.zero_()

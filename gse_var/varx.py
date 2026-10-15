@@ -19,7 +19,6 @@ from .exogenous import ExogenousLayout
 from .training import (
     GSEVARTrainingConfig,
     _iter_batches,
-    _initialize_intercept,
     _make_endogenous_regularizer,
     _resolve_device,
     _validate_config,
@@ -689,8 +688,7 @@ def fit_gse_varx(
     num_endogenous = dataset.endogenous_predictors.shape[-1]
     num_exogenous = dataset.exogenous_predictors.shape[-1]
 
-    new_model = model is None
-    if new_model:
+    if model is None:
         model = GSEVARX(
             num_endogenous=num_endogenous,
             num_exogenous=num_exogenous,
@@ -730,11 +728,6 @@ def fit_gse_varx(
 
     model.to(device)
     model.project_causal_gates_()
-    if new_model:
-        _initialize_intercept(
-            model, (dataset.endogenous_predictors, dataset.exogenous_predictors),
-            dataset.responses, config.batch_size,
-        )
     endogenous_regularizer, exogenous_regularizer = _make_regularizers(config, dataset_np.exogenous_layout)
     optimizer = _make_optimizer(config, model)
     criterion = nn.MSELoss(reduction="mean")

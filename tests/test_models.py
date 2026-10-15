@@ -34,6 +34,8 @@ def test_fast_jacobian_matches_explicit_autograd():
         num_hidden_layers=2,
     ).double()
     with torch.no_grad():
+        # Exercise a nonlinear learned state, not only the constant initial head.
+        model.coeff_net.weights[-1].normal_(std=0.1)
         model.causal_gate[0, 1, 2] = 0.0
     inputs = torch.randn(4, 2, 3, dtype=torch.float64)
 
@@ -67,6 +69,8 @@ def test_fast_jacobian_penalty_gradient_matches_explicit_autograd():
         hidden_layer_size=4,
         num_hidden_layers=2,
     ).double()
+    with torch.no_grad():
+        fast_model.coeff_net.weights[-1].normal_(std=0.1)
     explicit_model = copy.deepcopy(fast_model)
     inputs = torch.randn(3, 2, 2, dtype=torch.float64)
 
@@ -121,6 +125,8 @@ def test_regularization_mismatch_stops_only_causal_gate_gradient():
         hidden_layer_size=4,
         num_hidden_layers=2,
     ).double()
+    with torch.no_grad():
+        model.coeff_net.weights[-1].normal_(std=0.1)
     inputs = torch.randn(3, 2, 2, dtype=torch.float64)
 
     with torch.no_grad():

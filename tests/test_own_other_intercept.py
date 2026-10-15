@@ -183,20 +183,19 @@ def test_intercept_is_optimized_without_weight_decay(varx, optimizer_name):
 
 @pytest.mark.parametrize("varx", [False, True])
 @pytest.mark.parametrize("optimizer", ["ista", "adam"])
-def test_zero_gate_fit_predicts_training_response_mean_with_unpenalized_intercept(varx, optimizer):
+def test_zero_gate_fit_learns_unpenalized_intercept_from_zero(varx, optimizer):
     rng = np.random.default_rng(32)
-    # At a zero-residual constant fit, both optimizers leave the intercept
-    # unchanged. Adam can otherwise revive zero gates before projection;
-    # train-only mean initialization is tested independently below.
+    # Strong proximal penalties keep all gates zero. The intercept must learn
+    # the constant response rather than being initialized from its mean.
     y = np.tile(np.array([[4.0, -2.0]]), (18, 1))
     x = rng.normal(size=(18, 3))
     config_type = GSEVARXTrainingConfig if varx else GSEVARTrainingConfig
-    config = config_type(order=2, hidden_layer_size=3, max_epochs=3, batch_size=50,
+    config = config_type(order=2, hidden_layer_size=3, max_epochs=1, batch_size=50,
                          gate_init=0.0, sparse_group_lambda=100.0, sparse_l1_lambda=100.0,
                          optimizer=optimizer, coefficient_weight_decay=1.0,
                          verbose=0, device="cpu")
     if varx:
-        # A validation-only offset must never enter intercept initialization.
+        # A validation-only offset must never enter the training update.
         validation = construct_varx_lagged_dataset(y + 100, x, order=2)
         result = fit_gse_varx(y, x, config, validation_data=validation)
         data = construct_varx_lagged_dataset(y, x, order=2)
@@ -208,7 +207,9 @@ def test_zero_gate_fit_predicts_training_response_mean_with_unpenalized_intercep
         data = construct_lagged_dataset(y, order=2)
         args = (torch.as_tensor(data.predictors),)
         assert result.causal_graph.sum() == 0
-    expected = data.responses.mean(axis=0)
+    gradient = -2 * data.responses.mean(axis=0) / data.responses.shape[1]
+    expected = (-config.learning_rate * gradient if optimizer == "ista" else
+                -config.learning_rate * gradient / (np.abs(gradient) + 1e-8))
     np.testing.assert_allclose(result.intercept, expected, atol=1e-5)
     prediction = result.model(*args)[0].detach().numpy()
     np.testing.assert_allclose(prediction, np.broadcast_to(expected, prediction.shape), atol=1e-5)
@@ -235,7 +236,7 @@ def test_provided_models_keep_their_intercept_and_intercept_mismatch_is_rejected
 
 @pytest.mark.parametrize("varx", [False, True])
 @pytest.mark.parametrize("gate_init", [0.0, 1.0])
-def test_new_model_intercept_initializes_from_batched_training_residuals(varx, gate_init):
+def test_new_model_intercept_starts_at_zero_without_using_responses(varx, gate_init):
     rng = np.random.default_rng(19)
     y = rng.normal(size=(13, 2)) + [4.0, -2.0]
     x = rng.normal(size=(13, 3))
@@ -252,12 +253,9 @@ def test_new_model_intercept_initializes_from_batched_training_residuals(varx, g
         result = fit_gse_var(y, config)
         args = (torch.as_tensor(data.predictors),)
     prediction = result.model(*args)[0].detach().numpy()
-    # The residual mean, not necessarily the response mean, is zero when
-    # the initial coefficient networks make nonconstant predictions.
-    np.testing.assert_allclose((data.responses - prediction).mean(axis=0),
-                               0.0, atol=1e-6)
-    if gate_init == 0.0:
-        np.testing.assert_allclose(result.intercept, data.responses.mean(axis=0), atol=1e-6)
+    np.testing.assert_array_equal(result.intercept, np.zeros(2))
+    latest = data.endogenous_predictors[:, -1] if varx else data.predictors[:, -1]
+    np.testing.assert_allclose(prediction, gate_init * latest, atol=1e-6)
 
 
 @pytest.mark.parametrize("varx", [False, True])
