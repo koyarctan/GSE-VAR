@@ -9,8 +9,8 @@ This code is designed around the following reference implementations and methods
 
 - GVAR: <https://github.com/i6092467/GVAR>
 - Neural-GC: <https://github.com/iancovert/Neural-GC>
-- VARX-L: Sparse Own/Other grouping and an unpenalized prediction intercept
-  (Nicholson, Matteson and Bien, 2017, Table 1, Eq. 7 and Appendix A.2):
+- VARX-L: an unpenalized prediction intercept
+  (Nicholson, Matteson and Bien, 2017, Appendix A.2):
   <https://doi.org/10.1016/j.ijforecast.2017.01.003>
 
 The main adaptation is a learnable non-negative `causal_gate` with shape
@@ -52,7 +52,6 @@ config = GSEVARTrainingConfig(
     regularizer="sparse_group_lasso",
     sparse_group_lambda=1e-2,
     sparse_l1_lambda=1e-3,
-    optimizer="ista",
     log_every=10,
     verbose=1,
 )
@@ -73,43 +72,21 @@ Epoch   10/200  | loss=1.38 | mse=1.22 | ngc=0.16 | smooth=0 | jacobian=0 | acti
 
 ## Sparse Group Lasso
 
-Both GSE-VAR and GSE-VARX default to `regularizer="sparse_group_lasso"`,
-`endogenous_grouping="own_other"`, and `fit_intercept=True`. No additional
-options are needed to activate these defaults. Penalty strengths are still
-chosen by the user; zero strengths do not induce sparsity.
-
-For endogenous gates, the default is the **unweighted Sparse Own/Other**
-grouping adapted from VARX-L. At each lag, all diagonal entries form one own
-group and all off-diagonal entries form another group. With $G_k$ denoting a
-lag gate matrix, the penalty is
-
-$$
-R_y(G)=\lambda_{\mathrm{group}}\sum_k
-\left(\|\operatorname{diag}(G_k)\|_2+
-\|(G_{k,i,j})_{i\ne j}\|_2\right)
-+\lambda_{\mathrm{l1}}\sum_{k,i,j}|G_{k,i,j}|.
-$$
-
-The two groups are independently shrunk with the same specified group
-strength. Individual gates can be removed by L1 shrinkage; no own edge is
-forced to remain. There are no `sqrt(group size)` multipliers or separately
-chosen own/other penalty ratios. This adapts the paper's grouping to structural
-gates, rather than reproducing its weighted penalty on linear coefficients.
-This distinction does not confer the paper's convex optimization guarantees
-on the nonlinear model.
+Both GSE-VAR and GSE-VARX default to `regularizer="sparse_group_lasso"`
+and always include an unpenalized intercept. All lags of each endogenous `(target, source)` pair
+form one unweighted group. Self-edges are penalized exactly like other edges.
+Penalty strengths are user-supplied; zero strengths do not induce sparsity.
 
 GSE-VARX keeps the existing exogenous grouping: all valid lags for each
 `(target, original source)` form one group. Current terms are included when
 specified. It does **not** automatically adopt the paper's grouping across
 all targets at a fixed exogenous source and lag.
 
-Set `endogenous_grouping="edge"` to compare against the original edge-wise
-SGL described below. The grouping option affects endogenous SGL only;
-explicit `group_lasso` and `hierarchical_group_lasso` selections retain their
-existing definitions. Graphs are still aggregated across lags by each
-target-source pair regardless of the optimization grouping.
+The previous `endogenous_grouping` option has been removed. Delete it from
+training configurations; there is no grouping switch. Explicit `group_lasso`
+and `hierarchical_group_lasso` retain their definitions.
 
-### Original edge-wise SGL
+### Edge-wise SGL
 
 Neural-GC's cMLP implementation supports a `GSGL` penalty, described in the
 repository as group sparse group lasso. Its proximal update first applies a
@@ -132,7 +109,7 @@ For each edge `source j -> target i`, define:
 g_{i,j} = (G_{1,i,j}, \dots, G_{K,i,j})
 ```
 
-The edge-wise NGC regularizer (`endogenous_grouping="edge"`) is:
+The edge-wise NGC regularizer is:
 
 ```math
 R_{\mathrm{SGL}}(G)
@@ -148,16 +125,153 @@ R_{\mathrm{SGL}}(G)
 directly. `lambda_ngc` is not used by `sparse_group_lasso`; it is reserved for
 `group_lasso` and `hierarchical_group_lasso`.
 
-With `optimizer="ista"`, the smooth prediction objective is optimized first,
-then the non-negative sparse-group proximal operator is applied to
-`causal_gate`:
+Coefficient/intercept Adam updates and ordinary gate proximal updates alternate.
+The gate block uses the non-negative sparse-group proximal operator:
 
 1. one-sided elementwise thresholding for lag-level sparsity;
-2. group soft-thresholding on each lag's own/other groups by default, or
-   over all lags for each target-source edge in `endogenous_grouping="edge"`.
+2. group soft-thresholding over all lags for each target-source edge.
 
 This preserves non-negativity and exact zeros. An edge is absent when all of
-its lag gates are zero, even when the optimization groups are own/other.
+its lag gates are zero.
+
+## Alternating proximal optimization
+
+Adam updates coefficient networks and the unpenalized intercept, followed by a
+fixed-step Euclidean proximal update for gates with the updated coefficients.
+`learning_rate` is Adam's base rate; `gate_learning_rate` is the proximal step
+(or the same rate when `None`). There is no line search, trial loss evaluation, step expansion,
+or automatic step reduction. An ordinary batch needs two forward/gradient
+evaluations, with no extra forward pass solely for logging.
+
+The objective still includes `coefficient_weight_decay / 2 *
+sum(coefficient_parameter**2)`. Both weights and network biases receive this
+L2 penalty; gates and the prediction intercept do not. The Jacobian
+regularizer still detaches gates. A fixed learning rate does not guarantee
+decreasing loss or global convergence; non-finite losses/gradients raise an
+error rather than automatically retrying at a smaller step.
+
+History reports pre-update `mse`, `ngc`, `smooth`, `jacobian`, `weight_decay`
+and their sum `loss`. It also reports `coefficient_step_size`, `gate_step_size`,
+`coefficient_gradient_norm`, and `gate_proximal_gradient_norm`. The latter is
+the gate-block displacement divided by the fixed step size, conditional
+on the updated coefficients; it is not proof of global optimality. The four
+optimizer diagnostics are zero for evaluation-only calls.
+
+### Separate coefficient and gate time scales
+
+The fixed training algorithm uses Adam for coefficient networks and the intercept,
+but **ordinary Euclidean proximal gradient for gates**. For example:
+
+```python
+config = GSEVARTrainingConfig(
+    order=1, hidden_layer_size=8, max_epochs=2000, batch_size=10000,
+    learning_rate=.003, gate_learning_rate=1.,
+    regularizer="group_lasso", lambda_ngc=.1 / 16,
+    coefficient_weight_decay=.0001, shuffle=False,
+)
+```
+
+The objective, grouping, nonnegative gate and input/output masks are unchanged.
+L2 is differentiated exactly once; Adam never updates gate moments. SGL and HGL
+remain available. The two-gradient-evaluation budget is unchanged. This is not
+FISTA, a line search, or a claim of PALM/global convergence. Adam's logged
+coefficient step size is its base learning rate, not each coordinate's actual
+displacement. An optional `epoch_callback(epoch, model, metrics)` in
+`fit_gse_var` can observe post-update states for external validation selection.
+
+`gate_learning_rate=None` uses the same base rate for both blocks.
+DisARM also accepts this optional field for a separate **logit** learning rate;
+the development-validated binary setting was coefficient LR .003, logit LR .03,
+initial opening probability .5, and `lambda_l0=.03 / 16`. Its old .9 probability
+initialization remains the default for reproducibility.
+
+These numeric settings were tested on a 16-variable sparse interacting nonlinear
+VAR, **not** certified for Citi Bike. Penalty strengths use a sum over gates;
+the example divides a per-target strength by 16 to match globally mean-scaled
+prediction loss. Do not copy it to a different dimension as an established
+optimum. Research protocol, failed ablations, unused-seed confirmation and
+reproduction commands are in `experiments/gate_research/REPORT.md` locally.
+
+## Binary gates with DisARM (separate, opt-in route)
+
+`fit_gse_var_disarm` uses Bernoulli structural gates and Adam for both
+coefficients and logits, separate from the continuous proximal route. Its gradient
+estimator follows Dong, Mnih and Tucker, **DisARM** (NeurIPS 2020), equations
+(6)--(8): <https://arxiv.org/abs/2006.10680>.
+
+```python
+from gse_var import GSEVARDisARMTrainingConfig, fit_gse_var_disarm
+
+config = GSEVARDisARMTrainingConfig(
+    order=6, hidden_layer_size=8, max_epochs=3000, batch_size=10000,
+    learning_rate=.003, gate_learning_rate=.03,
+    lambda_l0=1e-3, gate_probability_init=0.9,
+    lambda_smooth=0.01, coefficient_weight_decay=0.01,
+    shuffle=False, seed=42, device="cuda:2",
+)
+result = fit_gse_var_disarm(data, config)
+print(result.model.gate_probabilities)  # sigmoid(logits), not causal probabilities
+print(result.model.causal_gate)         # fixed 0/1 mask used for inference
+print(result.causal_graph)              # any selected lag for each target/source
+```
+
+The objective is the expected masked prediction loss (plus the configured
+coefficient smoothness/Jacobian penalties), the coefficient-network L2 penalty,
+and `lambda_l0 * sum(sigmoid(gate_logits))`. The sum counts **lag routes** over
+all targets/sources, including self-routes, not lag-integrated graph edges.
+This is an expected L0 selection cost, not a Hard Concrete relaxation and not
+the existing SGL/group penalty. Gates and the prediction intercept have no L2
+decay. Unlike the existing gate-detached local Jacobian update, the DisARM
+logit estimator includes any mask-dependent Jacobian penalty in its sampled
+objective; that difference applies only to the new route.
+
+Each step evaluates two antithetic **binary** masks at the same parameter
+state. Each mask is shared across all time points in the batch and applies to
+both coefficient-generator inputs and coefficient outputs. Coefficient
+gradients average the two losses; logit gradients use DisARM plus the analytic
+gradient of the expected selection cost. A single joint Adam/SGD step follows.
+For each target's gates, DisARM uses that target's MSE, absolute smoothness and
+Jacobian loss differences, retaining the original `1 / num_vars` weighting.
+This removes unrelated targets' loss fluctuations without changing the
+expected objective or rescaling `lambda_l0`. Relative smoothness retains its
+full scalar difference because its denominator couples all targets; only
+the separable terms are localized in that mode. Coefficient/intercept updates
+and scalar loss reporting are unchanged at the same parameters and masks.
+There is no straight-through gradient, temperature schedule, line search,
+trial-step loop, or post-selection refit. With `lambda_jacobian=0`, there are
+exactly two coefficient-network forward/backward evaluations per batch.
+
+Prediction, coefficient plots, and checkpoint validation always use the
+deterministic mask `gate_logits >= 0` (opening probability >= 0.5). This is a
+per-entry threshold, not a joint MAP optimization or causal probability
+estimate. The buffer `causal_gate` and logits are saved in the same state dict;
+both must be restored with the coefficient parameters. If manually editing
+logits, call `model.update_causal_gate_()` before inference. The optional
+`epoch_callback(epoch, model, metrics)` runs after each epoch with the refreshed
+fixed mask, without restarting either optimizer or sampling RNG. Training
+history is a pre-update two-mask Monte Carlo estimate; validation evaluates
+the actual fixed-mask model. Unbiased logit gradients do not guarantee an
+accurate graph or a good deterministic-mask forecast.
+
+In `experiments/11_GSE_VAR_lambda簡易探索.ipynb`, set `GSE_METHOD="disarm"`
+and edit `DISARM_CONFIG`; use `GSE_METHOD="proximal"` and the preserved
+`MODEL_CONFIG` for the continuous proximal route. The single training cell keeps the
+same data, linear-SGL comparison, 100-epoch checkpoint selection and figures.
+It saves no learning results. Restart the kernel once after updating the
+embedded implementation. The full 11 experiment and notebooks 12/13 are not
+changed by this addition.
+
+The public GSE configurations no longer accept `optimizer`, `fit_intercept`,
+or `causal_threshold`: remove these arguments from callers. Continuous training
+always uses coefficient Adam plus gate prox; DisARM always uses Adam. Gated
+models always include an intercept and an edge is selected iff any lag gate is
+nonzero. This preserves the retained algorithms' numerical updates, not the
+deleted SGD/direct-Adam variants. Checkpoints with intercept parameters keep
+their parameter keys and shapes. The quick Citi Bike notebook embeds the new
+implementation; restart its kernel after updating. Archived results and the
+frozen full-11, Lorenz96 and linear-VAR experiment notebooks are not rewritten.
+The quick notebook's helper source is `experiments/_citibike_quick_core.py`;
+its packed copy is checked against that source by the notebook tests.
 
 ## Default initialization
 
@@ -182,19 +296,14 @@ uses the paper's exact linear centering/profile solution at every update.
 Initialization does not use response statistics. A supplied model is not
 reinitialized, and VARX early stopping restores the intercept with the complete
 best-epoch state. `result.intercept` returns a copy of the learned vector in
-model-response units, or `None` when disabled. It is excluded from coefficient
+model-response units. It is excluded from coefficient
 arrays, causal graphs, forests, and coefficient/Jacobian comparisons; its
 input derivative is zero. Consequently, all-zero gates leave the fitted
 constant prediction, not a forced zero prediction.
 
-Use `fit_intercept=False` for an intercept-free comparison. Older intercept-
-free `state_dict`s can be loaded into models constructed with that option;
-the original ungated GVAR baseline remains intercept-free by default. Older
-pickled models also keep their original predictions without injecting a new
-parameter. These new defaults change training conditions: archived notebook
-outputs were not recomputed and do not establish performance for the new
-specification. The persistence predictor is only the starting point, not a
-fixed forecasting constraint.
+There is no intercept switch for GSE models. The separate ungated GVAR baseline
+retains its original intercept-free architecture. The persistence predictor is
+only the starting point, not a fixed forecasting constraint.
 
 ## Design Notes
 
@@ -210,14 +319,10 @@ fixed forecasting constraint.
   penalty. Lag index `0` is the most distant lag, so nested hierarchical groups
   are prefixes: `[t - order]`, `[t - order, t - order + 1]`, ...,
   `[t - order, ..., t - 1]`.
-- `optimizer="adam"` adds the nonsmooth penalty directly to the objective and
-  projects the gate onto the non-negative orthant after each update. This is
-  easy to optimize but does not guarantee exact zeros.
-- `optimizer="ista"` optimizes the smooth objective and then applies the
-  proximal operator to `causal_gate`, producing exact zeros in the learned
-  causal structure.
-- The default causal graph threshold is `1e-8` to avoid treating tiny numerical
-  residue as a nonzero edge.
+- Coefficients/intercept use Adam; gates use the exact nonnegative proximal
+  operator after the coefficient update. There is no optimizer selection.
+- Graphs use exact nonzero support, including tiny nonzero gates. There is no
+  post-training threshold setting or threshold search.
 
 ## Training Logs
 
@@ -225,7 +330,7 @@ Training logs are controlled by `verbose` and `log_every`.
 
 - `verbose=0`: no logs.
 - `verbose=1`: print epoch, loss, MSE, NGC penalty, smoothness penalty, and
-  Jacobian penalty, and active edge count.
+  Jacobian penalty, L2 penalty, gate step/residual, and active edge count.
 - `log_every=10`: print every 10 epochs, plus the first and final epoch.
 
 ## Coefficient--Jacobian Agreement
@@ -289,7 +394,7 @@ This adds
 \left(J_{t,k,i,j} - C_{t,k,i,j}\right)^2
 ```
 
-to the differentiable part of either the Adam or ISTA objective and records
+to the differentiable part of the alternating training objective and records
 the weighted value in `result.history["jacobian"]`. The default is
 `lambda_jacobian=0.0`, so existing training behavior and cost are unchanged.
 Jacobian agreement and temporal smoothness constrain different properties and
@@ -299,7 +404,7 @@ During training, the causal gate is treated as a fixed value only inside the
 Jacobian penalty. Both its coefficient-input mask and coefficient-output mask
 are detached in that branch. The gate continues to receive gradients from the
 prediction and smoothness objectives and continues to receive the configured
-NGC/ISTA proximal update. This separation prevents the model from reducing
+NGC proximal update. This separation prevents the model from reducing
 the Jacobian penalty merely by shrinking or deleting a causal edge; the
 coefficient generator must instead improve its local coefficient/Jacobian
 agreement. The public configuration remains unchanged: set
@@ -340,7 +445,6 @@ config = GSEVARXTrainingConfig(
     lambda_smooth=1e-2,
     lambda_jacobian=10.0,
     coefficient_weight_decay=1e-4,
-    optimizer="ista",
     device="cuda",
 )
 
@@ -510,7 +614,7 @@ config = GSEVARXTrainingConfig(
     sparse_group_lambda=0.01, sparse_l1_lambda=0.005,
     regularizer_exog="sparse_group_lasso",
     sparse_group_lambda_exog=0.01, sparse_l1_lambda_exog=0.005,
-    coefficient_weight_decay=1e-4, optimizer="ista", causal_threshold=0,
+    coefficient_weight_decay=1e-4,
 )
 result = fit_gse_varx(
     endog_train, exog_train, config,
@@ -528,7 +632,7 @@ sources receive the same gate regularization as other sources. Group norms
 and hierarchical nested-group norms are unweighted: there is no extra
 `sqrt(group size)` multiplier or group-size-weighting option. Hierarchical
 penalties still penalize distant lags through overlapping nested groups. The nonnegative
-proximal update retains exact zeros with ISTA. Jacobian penalties continue to
+proximal update retains exact zeros. Jacobian penalties continue to
 hold both gates fixed. Hierarchical exogenous penalties reject layouts with
 leads: a one-sided lag hierarchy should not silently impose an order on
 future and past calendar effects.
@@ -814,7 +918,7 @@ $$\Phi_{k,i,:}(u_{k,i,t})=f_{k,i}(u_{k,i,t})$$
 
 $$\hat{x}_{i,t}=\nu_i+\sum_{k=1}^{K}\sum_{j=1}^{p}G_{k,i,j}\Phi_{k,i,j}(G_{k,i,:}\odot x_{t-k})x_{j,t-k}$$
 
-である。$\nu_i$ は入力に依存しない独立した予測切片で、既定では有効。スパース罰則と `coefficient_weight_decay` の対象に含めず、0から同時学習する。係数生成ネットワーク内部のバイアスとは別のパラメータである。実装上の形状は次の通り。
+である。$\nu_i$ は入力に依存しない独立した予測切片で、常に有効。スパース罰則と `coefficient_weight_decay` の対象に含めず、0から同時学習する。係数生成ネットワーク内部のバイアスとは別のパラメータである。実装上の形状は次の通り。
 
 ```text
 coeffs.shape      == [batch, lag, target, source]
@@ -852,15 +956,15 @@ $$G_{1,i,j}=\cdots=G_{K,i,j}=0$$
 
 学習後のGranger因果行列は従来どおり
 
-$$\hat{A}_{i,j}=\mathbf{1}\left[\|G_{:,i,j}\|_2>\tau\right]$$
+$$\hat{A}_{i,j}=\mathbf{1}\left[\exists k:\ G_{k,i,j}\ne 0\right]$$
 
 で構成する。
 
-ここで、$\tau$ は因果グラフを構成するための閾値であり、デフォルトは `1e-8` である。近接勾配法を最適化手法とする場合、$\tau=0$にしてもスパースなグラフが得られる。
+全ラグの厳密なゼロだけを非選択とする。因果グラフの閾値を設定・探索するオプションはない。
 
 ### 6. 目的関数
 
-目的関数は、予測損失、時間方向の平滑化、NGC型正則化からなる。
+目的関数は、予測損失、時間方向の平滑化、NGC型正則化、および指定した場合のヤコビアン正則化・係数ネットワークのL2正則化からなる。
 
 ```math
 \mathcal{L}
@@ -870,6 +974,8 @@ $$\hat{A}_{i,j}=\mathbf{1}\left[\|G_{:,i,j}\|_2>\tau\right]$$
 \mathcal{R}_{\mathrm{smooth}}
 +
 \mathcal{R}_{\mathrm{ngc}}
++\mathcal{R}_{\mathrm{Jac}}
++\frac{\mu}{2}\|\theta_{\mathrm{coef}}\|_2^2
 ```
 
 予測損失は平均二乗誤差である。
@@ -877,12 +983,12 @@ $$\hat{A}_{i,j}=\mathbf{1}\left[\|G_{:,i,j}\|_2>\tau\right]$$
 ```math
 \mathcal{L}_{\mathrm{pred}}
 =
-\frac{1}{N}
+\frac{1}{Np}
 \sum_t
 \|x_t-\hat{x}_t\|_2^2
 ```
 
-`optimizer="ista"` の場合、$\mathcal{R}_{\mathrm{ngc}}$は通常の勾配計算には含めず、勾配ステップ後に `causal_gate` へ近接作用素として適用する。
+$\mathcal{R}_{\mathrm{ngc}}$は通常の勾配計算には含めず、ゲートの勾配ステップ後に近接作用素として適用する。
 
 ### 7. Temporal Smoothness
 
@@ -923,11 +1029,7 @@ relative mode では、係数スケールで正規化する。
 
 #### 8.1 Sparse Group Lasso
 
-既定は VARX-L の Sparse Own/Other を構造ゲートへ適用した、群サイズ重みなしの SGL である。各ラグの対角成分を自己ラグ群、非対角成分を他変数ラグ群として独立に選択し、L1 項で群内の個別ゲートを選択する。両群の指定強度は同じで、自己エッジを強制的に残す仕様ではない。
-
-$$\mathcal R_y(G)=\lambda_{\mathrm{group}}\sum_k\left(\|\operatorname{diag}(G_k)\|_2+\|(G_{k,i,j})_{i\ne j}\|_2\right)+\lambda_{\mathrm{l1}}\sum_{k,i,j}|G_{k,i,j}|.$$
-
-`endogenous_grouping="edge"` を指定すると、以下の従来の辺単位 SGL に戻る。GSE-VARX の外生側は、元変数・予測対象ごとに有効な全ラグをまとめる従来の SGL を維持する。最適化のグループと、可視化のラグ集約後エッジは区別する。
+既定は、予測先・入力元ごとの全ラグを1群にする辺単位SGLである。群サイズ重みは付けず、自己辺と他の辺を同じ方法で正則化する。グループ切替オプションはない。GSE-VARXの外生側も、元変数・予測対象ごとに有効な全ラグをまとめる。
 
 辺単位の Sparse Group Lasso は、edge全体をまとめて削除する圧力と、個別lagを削除する圧力を同時に与える。
 
@@ -1010,18 +1112,18 @@ B_{r,i,j}
 lambda_ngc = lambda_ngc
 ```
 
-### 9. ISTAによる近接更新
+### 9. 係数Adamとゲート近接勾配の交互更新
 
-`optimizer="adam"` の場合、NGC正則化を損失に足して通常の勾配法で最適化する。ただし、Adamだけではgateが厳密なゼロになりにくい。
-
-`optimizer="ista"` の場合、まずsmooth partに対して通常の勾配ステップを行う。
+各バッチで係数ネットワーク・切片をAdamで更新し、その更新後の係数を使ってゲートを通常の近接勾配で更新する。ゲートにAdamのモーメントは適用しない。以下のsmooth partには、指定したヤコビアン罰則と係数ネットワークのL2罰則も含める。
 
 ```math
 \mathcal{L}_{\mathrm{smooth-part}}
 =
 \mathcal{L}_{\mathrm{pred}}
 +
-\lambda_{\mathrm{smooth}}\mathcal{R}_{\mathrm{smooth}}
+\mathcal{R}_{\mathrm{smooth}}
++\mathcal{R}_{\mathrm{Jac}}
++\frac{\mu}{2}\|\theta_{\mathrm{coef}}\|_2^2
 ```
 
 ```math
@@ -1045,6 +1147,10 @@ G^{(m+1)}
 
 ここで、$`\iota_{\{G\geq 0\}}`$ は非負制約を表す指示関数である。
 
+係数側のAdam基準学習率は`learning_rate`、ゲート側の固定刻み幅は`gate_learning_rate`（`None`なら前者と共通）で指定する。刻み幅の拡大・半減、ラインサーチ、更新候補の損失再評価は行わない。通常の1バッチは係数用とゲート用のforward・勾配計算各2回だけで、ログ用の追加forwardも行わない。非有限の損失・勾配はエラーにする。
+
+損失履歴は各バッチの更新前の同一状態で記録し、`loss = mse + smooth + jacobian + ngc + weight_decay`となる。`gate_step_size`は固定学習率であり、係数更新後の条件付きゲート近接勾配残差`gate_proximal_gradient_norm`も保存する。ヤコビアン罰則のgate-detachは維持する。
+
 以下では、$`U=G^{(m+1/2)}`$とおく。
 
 #### 9.1 Sparse Group Lassoの非負近接更新
@@ -1052,8 +1158,6 @@ G^{(m+1)}
 構造ゲートには非負制約を課す。$U=G^{(m+1/2)}$ とすると、まず一方向のL1 thresholdingを適用する。
 
 $$Z_{k,i,j}=\max\left(U_{k,i,j}-\eta\lambda_{\mathrm{l1}},0\right)$$
-
-既定の Own/Other では、この後、各ラグの対角群と非対角群それぞれに、しきい値 $\eta\lambda_{\mathrm{group}}$ の group shrinkage を行う。以下は `endogenous_grouping="edge"` の場合の更新である。
 
 次に、各edge `j -> i` のラグベクトル
 
@@ -1128,7 +1232,7 @@ G^{(m+1)}=Z^{(K)}
 
 事後的な閾値処理では、学習中には小さい非ゼロ値のedgeが予測に使われる。その後で係数や重みを閾値以下だからゼロとみなす。
 
-一方、ISTAによる近接更新では、学習過程の途中でgateそのものが厳密にゼロになる。ゼロになったedgeは、その後のforward計算で予測に使われない。
+一方、ゲートの近接更新では、学習過程の途中でgateそのものが厳密にゼロになる。ゼロになったedgeは、その後のforward計算で予測に使われない。
 
 したがって、近接勾配法の利点は単に「最後に0/1を決める」ことではなく、構造選択が学習過程に組み込まれる点にある。
 
@@ -1146,11 +1250,11 @@ G^{(m+1)}=Z^{(K)}
 =
 \mathbf{1}
 \left[
-\|g_{i,j}\|_2>\tau
+\exists k:\ G_{k,i,j}\ne 0
 \right]
 ```
 
-$\hat{A}_{i,j}=1$ なら、変数 $j$ の過去が変数 $i$ の予測に寄与すると判定する。
+$\hat{A}_{i,j}=0$ なら、その過去系列から予測への経路が遮断される。非ゼロは経路が残ることを示すだけで、予測への寄与や真の因果性を保証しない。
 
 一方、有効係数
 
@@ -1170,9 +1274,9 @@ G_{k,i,j}\Phi_{k,i,j}\!\left(G_{k,i,:}\odot x_{t-k}\right)
 
 1. GVARにより、非線形・状態依存的な自己回帰係数を学習する。
 2. `causal_gate` を係数生成器への入力と生成後の係数に適用し、動的係数と静的なGranger構造を分離する。
-3. 既定の重みなし Sparse Own/Other SGL により、自己ラグと他変数ラグを区別し、L1 項で個別ゲートを選択する。従来の辺単位 SGL は比較用に残す。
+3. 辺単位のSGLで各辺の全ラグをまとめて選択し、L1項で個別ラグのゲートも選択する。自己辺も同様に正則化する。
 4. Hierarchical Group Lassoにより、ラグ方向の入れ子構造を利用したラグ選択を行う。
-5. ISTAの近接更新により、`causal_gate` に厳密なゼロを生成する。
-6. Granger因果行列は、状態依存係数の事後的な閾値処理ではなく、gate normに基づいて構成する。
+5. 係数をAdam、ゲートを固定刻み幅の近接勾配で交互に更新し、厳密なゼロを生成する。
+6. Granger因果行列は、状態依存係数の事後的な閾値処理ではなく、ゲートの厳密な非ゼロから構成する。
 7. 有効係数を見ることで、効果の符号やラグごとの分布も解釈できる。
 8. 独立した無罰則の予測切片を持つため、ゲートが全てゼロでも学習された定数予測を維持する。切片は因果エッジには含めない。

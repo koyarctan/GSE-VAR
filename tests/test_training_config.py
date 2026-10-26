@@ -37,8 +37,7 @@ def test_hierarchical_group_lasso_config_uses_lambda_ngc():
     assert len(result.history["loss"]) == 1
 
 
-@pytest.mark.parametrize("optimizer", ["ista", "adam"])
-def test_optional_jacobian_regularization_is_logged(optimizer):
+def test_optional_jacobian_regularization_is_logged():
     data = np.random.default_rng(2).normal(size=(16, 2)).astype("float32")
     config = GSEVARTrainingConfig(
         order=2,
@@ -46,7 +45,6 @@ def test_optional_jacobian_regularization_is_logged(optimizer):
         max_epochs=1,
         batch_size=7,
         lambda_jacobian=0.1,
-        optimizer=optimizer,
         verbose=0,
     )
 

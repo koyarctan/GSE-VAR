@@ -151,7 +151,6 @@ def plot_causal_gate_by_lag(
     target_names=None,
     source_names=None,
     binary: bool = False,
-    threshold: float | None = None,
     include_summary: bool = True,
     summary: GateSummaryName = "norm",
     percentile: float = 99.0,
@@ -170,7 +169,7 @@ def plot_causal_gate_by_lag(
 
     VARX uses branch='endogenous'/'exogenous'. Layout-aware exogenous views
     retain actual lag/current/lead numbers, original sources, and NaN holes.
-    binary=True thresholds each lag and the aggregated L2 gate separately.
+    binary=True selects exactly the nonzero lag routes and their union.
 
     Parameters
     ----------
@@ -186,14 +185,12 @@ def plot_causal_gate_by_lag(
     gate, lags, names, sources = _branch_gate(result_or_model, branch, variable_names,
                                             target_names, source_names)
     order, n_targets, n_sources = gate.shape
-    threshold = _threshold(result_or_model, threshold)
     if binary and include_summary and summary != "norm":
         raise ValueError("binary graph summaries use lag-direction L2 norms")
-    mats = [_binary_gate(gate[k], threshold) if binary else gate[k] for k in range(order)]
+    mats = [_binary_gate(gate[k]) if binary else gate[k] for k in range(order)]
     titles = [_lag_title(lag) for lag in lags]
     if include_summary:
-        summary_mat = _summary_gate(gate, summary)
-        mats.append(_binary_gate(summary_mat, threshold) if binary else summary_mat)
+        mats.append(_binary_graph(gate) if binary else _summary_gate(gate, summary))
         titles.append("Aggregated graph" if binary else f"{summary} summary")
 
     vmin, vmax = _heatmap_limits(mats, percentile=percentile)
@@ -265,15 +262,14 @@ def plot_causal_gate_by_lag(
         return fig, axes
 
 
-def _threshold(result_or_model, threshold):
-    value = getattr(result_or_model, "causal_threshold", 0.0) if threshold is None else threshold
-    if not np.isfinite(value) or value < 0:
-        raise ValueError("threshold must be finite and nonnegative")
-    return float(value)
+def _binary_gate(gate):
+    return np.where(np.isfinite(gate), (gate != 0).astype(float), np.nan)
 
 
-def _binary_gate(gate, threshold):
-    return np.where(np.isfinite(gate), (gate > threshold).astype(float), np.nan)
+def _binary_graph(gate):
+    valid = np.isfinite(gate)
+    selected = np.any(valid & (gate != 0), axis=0)
+    return np.where(valid.any(axis=0), selected.astype(float), np.nan)
 
 
 def _lag_title(lag):
@@ -342,9 +338,9 @@ class CausalGateMatrices:
     source_names: tuple[str, ...]
 
 
-def causal_gate_matrices(result_or_model, *, branch="endogenous", threshold=None,
+def causal_gate_matrices(result_or_model, *, branch="endogenous",
                          lag_scope="all", variable_names=None, target_names=None, source_names=None):
-    """Binary lag views and aggregate-then-threshold L2 graph; NaN = unused.
+    """Nonzero lag routes and their binary union; NaN = unused.
 
     ``lag_scope='past'`` excludes current/lead inputs. An all-input exogenous
     graph is a predictive dependency graph, not a Granger significance test.
@@ -355,19 +351,18 @@ def causal_gate_matrices(result_or_model, *, branch="endogenous", threshold=None
         raise ValueError("lag_scope must be 'all' or 'past'")
     if lag_scope == "past":
         gate, lags = gate[lags > 0], lags[lags > 0]
-    value = _threshold(result_or_model, threshold)
-    return CausalGateMatrices(lags=lags.copy(), by_lag=_binary_gate(gate, value),
-                             aggregated=_binary_gate(_summary_gate(gate, "norm"), value),
+    return CausalGateMatrices(lags=lags.copy(), by_lag=_binary_gate(gate),
+                             aggregated=_binary_graph(gate),
                              target_names=tuple(targets), source_names=tuple(sources))
 
 
-def plot_causal_graph_matrix(result_or_model, *, branch="endogenous", threshold=None,
+def plot_causal_graph_matrix(result_or_model, *, branch="endogenous",
                              lag_scope="all", variable_names=None, target_names=None,
                              source_names=None, title=None, figsize=None, annotate=None,
                              tick_label_step=1, cmap="viridis", save_path=None, dpi=300, show=True):
     """Plot the lag-aggregated binary graph separately from lag panels."""
     plt = _require_matplotlib()
-    matrices = causal_gate_matrices(result_or_model, branch=branch, threshold=threshold,
+    matrices = causal_gate_matrices(result_or_model, branch=branch,
                                     lag_scope=lag_scope, variable_names=variable_names,
                                     target_names=target_names, source_names=source_names)
     mat = matrices.aggregated

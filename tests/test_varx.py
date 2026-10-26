@@ -127,8 +127,7 @@ def test_varx_jacobian_regularizer_does_not_update_either_gate():
     assert torch.count_nonzero(model.exogenous_gate.grad) > 0
 
 
-@pytest.mark.parametrize("optimizer", ["ista", "adam"])
-def test_fit_gse_varx_smoke_and_diagnostics(optimizer):
+def test_fit_gse_varx_smoke_and_diagnostics():
     rng = np.random.default_rng(13)
     endog = rng.normal(size=(20, 2)).astype("float32")
     exog = rng.normal(size=(20, 3)).astype("float32")
@@ -145,7 +144,6 @@ def test_fit_gse_varx_smoke_and_diagnostics(optimizer):
         lambda_ngc_exog=2e-3,
         lambda_jacobian=0.1,
         lambda_jacobian_exog=0.2,
-        optimizer=optimizer,
         verbose=0,
     )
 

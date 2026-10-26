@@ -205,8 +205,8 @@ class GSEVAR(nn.Module):
     direct coefficient path nor an indirect coefficient-generation path to
     target ``i`` at lag ``k``.
 
-    Gated models have a separate, input-independent prediction intercept by
-    default. It is not part of the coefficient tensor or the causal graph.
+    Gated models always have a separate, input-independent prediction intercept.
+    It is not part of the coefficient tensor or the causal graph.
     With the default unit gates, initial predictions copy the most recent
     observation: only that lag's coefficient diagonal starts at one.
     """
@@ -219,7 +219,6 @@ class GSEVAR(nn.Module):
         num_hidden_layers: int = 1,
         use_causal_gate: bool = True,
         gate_init: float = 1.0,
-        fit_intercept: bool | None = None,
     ) -> None:
         super().__init__()
         if num_vars <= 0:
@@ -238,12 +237,6 @@ class GSEVAR(nn.Module):
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
         self.use_causal_gate = use_causal_gate
-        # None preserves the original ungated GVAR baseline by default.
-        if fit_intercept is None:
-            fit_intercept = use_causal_gate
-        if not isinstance(fit_intercept, bool):
-            raise ValueError("fit_intercept must be a bool")
-        self.fit_intercept = fit_intercept
 
         if use_causal_gate:
             # Target-specific coefficient generators are required because each
@@ -278,22 +271,20 @@ class GSEVAR(nn.Module):
             self.register_parameter("causal_gate", None)
 
         self.register_parameter(
-            "intercept", nn.Parameter(torch.zeros(num_vars)) if fit_intercept else None
+            "intercept", nn.Parameter(torch.zeros(num_vars)) if use_causal_gate else None
         )
 
     def reset_parameters(self) -> None:
         self.coeff_net.reset_parameters()
         if self.causal_gate is not None:
             nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
-        if getattr(self, "intercept", None) is not None:
+        if self.intercept is not None:
             with torch.no_grad():
                 self.intercept.zero_()
 
     def _add_intercept(self, predictions: torch.Tensor) -> torch.Tensor:
-        # Old pickled models did not have an intercept; keep their inference
-        # unchanged rather than silently injecting an untrained parameter.
-        intercept = getattr(self, "intercept", None)
-        return predictions if intercept is None else predictions + intercept
+        # Only the separate, ungated GVAR baseline has no intercept.
+        return predictions if self.intercept is None else predictions + self.intercept
 
     @torch.no_grad()
     def project_causal_gate_(self) -> torch.Tensor:
@@ -451,9 +442,11 @@ class GSEVAR(nn.Module):
         return torch.linalg.vector_norm(self.causal_gate, ord=2, dim=0)
 
     @torch.no_grad()
-    def causal_graph_from_gate(self, threshold: float = 0.0) -> torch.Tensor:
-        """Return a binary Granger graph from structural gate groups."""
-        return (self.gate_group_norms() > threshold).to(torch.int64)
+    def causal_graph_from_gate(self) -> torch.Tensor:
+        """An edge is absent exactly when all its lag routes are zero."""
+        if self.causal_gate is None:
+            raise RuntimeError("causal_graph_from_gate requires use_causal_gate=True")
+        return self.causal_gate.ne(0).any(dim=0).to(torch.int64)
 
     @staticmethod
     def coefficient_strength(
@@ -500,7 +493,6 @@ class GSEVARX(nn.Module):
         gate_init: float = 1.0,
         exogenous_gate_init: float | None = None,
         exogenous_layout: ExogenousLayout | None = None,
-        fit_intercept: bool = True,
     ) -> None:
         super().__init__()
         if num_endogenous <= 0:
@@ -517,8 +509,6 @@ class GSEVARX(nn.Module):
             )
         if hidden_layer_size <= 0:
             raise ValueError("hidden_layer_size must be positive")
-        if not isinstance(fit_intercept, bool):
-            raise ValueError("fit_intercept must be a bool")
         if not math.isfinite(gate_init) or gate_init < 0:
             raise ValueError("gate_init must be non-negative")
         if exogenous_gate_init is None:
@@ -542,7 +532,6 @@ class GSEVARX(nn.Module):
         self.exogenous_layout = exogenous_layout
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
-        self.fit_intercept = fit_intercept
 
         self.endogenous_coeff_net = TargetLagwiseMLP(
             num_lags=order,
@@ -577,21 +566,17 @@ class GSEVARX(nn.Module):
                 float(exogenous_gate_init),
             )
         )
-        self.register_parameter(
-            "intercept", nn.Parameter(torch.zeros(num_endogenous)) if fit_intercept else None
-        )
+        self.intercept = nn.Parameter(torch.zeros(num_endogenous))
 
     def reset_parameters(self) -> None:
         self.endogenous_coeff_net.reset_parameters()
         self.exogenous_coeff_net.reset_parameters()
         nn.init.ones_(self.endogenous_coeff_net.biases[-1][-1].diagonal())
-        if getattr(self, "intercept", None) is not None:
-            with torch.no_grad():
-                self.intercept.zero_()
+        with torch.no_grad():
+            self.intercept.zero_()
 
     def _add_intercept(self, predictions: torch.Tensor) -> torch.Tensor:
-        intercept = getattr(self, "intercept", None)
-        return predictions if intercept is None else predictions + intercept
+        return predictions + self.intercept
 
     def _validate_inputs(
         self,
@@ -791,32 +776,24 @@ class GSEVARX(nn.Module):
         self.endogenous_gate.clamp_(min=0.0)
         self.exogenous_gate.clamp_(min=0.0)
 
-    @staticmethod
-    def _gate_group_norms(gate: torch.Tensor) -> torch.Tensor:
-        return torch.linalg.vector_norm(gate, ord=2, dim=0)
-
     @torch.no_grad()
     def endogenous_graph_from_gate(
         self,
-        threshold: float = 0.0,
     ) -> torch.Tensor:
-        return (
-            self._gate_group_norms(self.endogenous_gate) > threshold
-        ).to(torch.int64)
+        return self.endogenous_gate.ne(0).any(dim=0).to(torch.int64)
 
     @torch.no_grad()
     def exogenous_graph_from_gate(
         self,
-        threshold: float = 0.0,
     ) -> torch.Tensor:
         if self.exogenous_layout is None:
-            norms = self._gate_group_norms(self.exogenous_gate)
+            selected = self.exogenous_gate.ne(0).any(dim=0)
         else:
-            norms = torch.stack([
-                torch.linalg.vector_norm(self.exogenous_gate[0, :, group], dim=-1)
+            selected = torch.stack([
+                self.exogenous_gate[0, :, group].ne(0).any(dim=-1)
                 for group in self.exogenous_layout.groups
             ], dim=-1)
-        return (norms > threshold).to(torch.int64)
+        return selected.to(torch.int64)
 
     @staticmethod
     def coefficient_strength(

@@ -176,30 +176,29 @@ def test_group_size_weighting_options_are_removed():
         GSEVARXTrainingConfig(exogenous_group_size_weights=True)
 
 
-def test_aggregate_then_threshold_not_threshold_then_or():
+def test_exact_nonzero_routes_and_aggregated_graph_agree():
     m = model()
     with torch.no_grad():
         m.exogenous_gate.zero_()
         m.exogenous_gate[0, 0, :2] = 0.08
-    matrices = causal_gate_matrices(m, branch="exogenous", threshold=0.1)
-    assert np.nansum(matrices.by_lag[:, 0, 0]) == 0
+    matrices = causal_gate_matrices(m, branch="exogenous")
+    assert np.nansum(matrices.by_lag[:, 0, 0]) == 2
     assert matrices.aggregated[0, 0] == 1
-    np.testing.assert_array_equal(m.exogenous_graph_from_gate(0.1), matrices.aggregated)
-    past = causal_gate_matrices(m, branch="exogenous", lag_scope="past", threshold=0)
+    np.testing.assert_array_equal(m.exogenous_graph_from_gate(), matrices.aggregated)
+    past = causal_gate_matrices(m, branch="exogenous", lag_scope="past")
     assert (past.lags > 0).all()
     assert np.isnan(past.aggregated[:, 2:]).all()
 
 
-@pytest.mark.parametrize("optimizer", ["ista", "adam"])
 @pytest.mark.parametrize("aggregation", ["max", "mean", "median"])
-def test_training_separate_regularizers_shapes_and_jacobian_gate_detachment(optimizer, aggregation):
+def test_training_separate_regularizers_shapes_and_jacobian_gate_detachment(aggregation):
     rng = np.random.default_rng(8)
     y, x = rng.normal(size=(12, 2)), rng.normal(size=(12, 6))
     cfg = GSEVARXTrainingConfig(order=2, hidden_layer_size=3, max_epochs=1, batch_size=16,
                                 regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
                                 regularizer_exog="sparse_group_lasso",
                                 sparse_group_lambda_exog=0.02, sparse_l1_lambda_exog=0.01,
-                                lambda_jacobian=0.1, optimizer=optimizer, strength_aggregation=aggregation,
+                                lambda_jacobian=0.1, strength_aggregation=aggregation,
                                 verbose=0, device="cpu")
     result = fit_gse_varx(y, x, cfg, exog_features=layout(), endog_names=["salesA", "salesB"])
     assert result.exogenous_coeffs.shape == (10, 1, 2, 6)

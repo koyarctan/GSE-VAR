@@ -17,7 +17,6 @@ class CoefficientEvaluation:
     exogenous_coeffs: np.ndarray | None = None
     endogenous_names: tuple[str, ...] | None = None
     exogenous_lags: np.ndarray | None = None
-    causal_threshold: float = 0.0
 
 
 def evaluate_coefficients(result_or_model, data, *, exog_inputs=None, batch_size=256):
@@ -86,5 +85,4 @@ def evaluate_coefficients(result_or_model, data, *, exog_inputs=None, batch_size
         exogenous_coeffs=np.concatenate(exogenous) if is_varx else None,
         endogenous_names=getattr(result_or_model, "endogenous_names", None),
         exogenous_lags=lags,
-        causal_threshold=getattr(result_or_model, "causal_threshold", 0.0),
     )

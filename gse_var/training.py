@@ -11,22 +11,17 @@ from torch import nn
 
 from .data import LaggedDataset, construct_lagged_dataset
 from .models import AggregationName, GSEVAR
-from .regularizers import (
-    EndogenousGroupingName, NGCRegularizer, OwnOtherSparseGroupRegularizer,
-    RegularizerName,
-)
+from .regularizers import ExogenousGroupRegularizer, NGCRegularizer, RegularizerName
 
-OptimizerName = Literal["adam", "ista"]
 SmoothnessMode = Literal["absolute", "relative"]
 
 
 @dataclass(frozen=True)
 class GSEVARTrainingConfig:
-    """Sparse Own/Other SGL and an unpenalized intercept are the defaults.
+    """Edge-wise sparse group lasso with an unpenalized intercept.
 
-    ``endogenous_grouping`` affects SGL only; ``edge`` restores the original
-    per-(target, source) lag groups. Explicit GL/HGL selections are unchanged.
-    Penalty strengths are still user-supplied, not data-tuned defaults.
+    Each target-source pair groups all its lags. Penalty strengths are
+    user-supplied; self-edges receive the same penalty as other edges.
     """
     order: int
     hidden_layer_size: int
@@ -41,19 +36,16 @@ class GSEVARTrainingConfig:
     regularizer: RegularizerName = "sparse_group_lasso"
     sparse_group_lambda: float = 0.0
     sparse_l1_lambda: float = 0.0
-    optimizer: OptimizerName = "ista"
     gate_init: float = 1.0
     seed: int | None = 42
     shuffle: bool = True
-    causal_threshold: float = 1e-8
     strength_aggregation: AggregationName = "max"
     smoothness_mode: SmoothnessMode = "absolute"
     smoothness_eps: float = 1e-8
     verbose: int = 1
     log_every: int = 10
     device: str | torch.device | None = None
-    endogenous_grouping: EndogenousGroupingName = "own_other"
-    fit_intercept: bool = True
+    gate_learning_rate: float | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -63,12 +55,10 @@ class GSEVARFitResult:
     coeffs: np.ndarray | None = None
     causal_strength: np.ndarray | None = None
     causal_graph: np.ndarray | None = None
-    causal_threshold: float = 0.0
 
     @property
-    def intercept(self) -> np.ndarray | None:
-        parameter = getattr(self.model, "intercept", None)
-        return None if parameter is None else parameter.detach().cpu().numpy().copy()
+    def intercept(self) -> np.ndarray:
+        return self.model.intercept.detach().cpu().numpy().copy()
 
 
 @dataclass(frozen=True)
@@ -86,16 +76,19 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
 
 
 def _validate_config(config: GSEVARTrainingConfig) -> None:
-    if config.endogenous_grouping not in ("own_other", "edge"):
-        raise ValueError("endogenous_grouping must be 'own_other' or 'edge'")
-    if not isinstance(config.fit_intercept, bool):
-        raise ValueError("fit_intercept must be a bool")
-    if config.lambda_ngc < 0:
-        raise ValueError("lambda_ngc must be non-negative")
-    if config.sparse_group_lambda < 0:
-        raise ValueError("sparse_group_lambda must be non-negative")
-    if config.sparse_l1_lambda < 0:
-        raise ValueError("sparse_l1_lambda must be non-negative")
+    if not math.isfinite(config.learning_rate) or config.learning_rate <= 0:
+        raise ValueError("learning_rate must be finite and positive")
+    if config.gate_learning_rate is not None and (
+        not math.isfinite(config.gate_learning_rate) or config.gate_learning_rate <= 0
+    ):
+        raise ValueError("gate_learning_rate must be finite and positive")
+    for name in (
+        "lambda_ngc", "sparse_group_lambda", "sparse_l1_lambda",
+        "lambda_smooth", "coefficient_weight_decay",
+    ):
+        value = getattr(config, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
     if not math.isfinite(config.lambda_jacobian) or config.lambda_jacobian < 0:
         raise ValueError("lambda_jacobian must be non-negative")
     if not math.isfinite(config.gate_init) or config.gate_init < 0:
@@ -127,7 +120,7 @@ def _make_gated_optimizer(
     *,
     gate_names: tuple[str, ...],
 ) -> torch.optim.Optimizer:
-    """Share decay policy while preserving parameter and optimizer-state order."""
+    """Adam for coefficients/intercept; gate groups only hold proximal metadata."""
     gate_params = []
     coeff_params = []
     intercept_params = []
@@ -144,31 +137,116 @@ def _make_gated_optimizer(
     param_groups = [
         {
             "params": coeff_params,
-            "weight_decay": config.coefficient_weight_decay,
+            "weight_decay": 0.0,
+            "objective_weight_decay": config.coefficient_weight_decay,
         },
-        {"params": gate_params, "weight_decay": 0.0},
-        {"params": intercept_params, "weight_decay": 0.0},
+        {"params": gate_params, "weight_decay": 0.0, "objective_weight_decay": 0.0},
+        {"params": intercept_params, "weight_decay": 0.0, "objective_weight_decay": 0.0},
     ]
-    if config.optimizer == "adam":
-        return torch.optim.Adam(param_groups, lr=config.learning_rate)
-    if config.optimizer == "ista":
-        return torch.optim.SGD(param_groups, lr=config.learning_rate)
-    raise ValueError(f"unsupported optimizer: {config.optimizer}")
+    if config.gate_learning_rate is not None:
+        param_groups[1]["lr"] = config.gate_learning_rate
+    return torch.optim.Adam(param_groups, lr=config.learning_rate)
 
 
 def _make_endogenous_regularizer(
     config: GSEVARTrainingConfig,
-) -> NGCRegularizer | OwnOtherSparseGroupRegularizer:
-    if config.regularizer == "sparse_group_lasso" and config.endogenous_grouping == "own_other":
-        return OwnOtherSparseGroupRegularizer(
-            sparse_l1_lambda=config.sparse_l1_lambda,
-            sparse_group_lambda=config.sparse_group_lambda,
-        )
+) -> NGCRegularizer:
     return NGCRegularizer(
         name=config.regularizer, lam=config.lambda_ngc, reduction="sum", lag_dim=0,
         sparse_l1_lambda=config.sparse_l1_lambda,
         sparse_group_lambda=config.sparse_group_lambda,
     )
+
+
+_OPTIMIZATION_METRICS = (
+    "weight_decay", "coefficient_step_size", "gate_step_size",
+    "coefficient_gradient_norm", "gate_proximal_gradient_norm",
+)
+
+
+def _weight_decay_penalty(
+    optimizer: torch.optim.Optimizer,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Explicit coefficient L2; Adam's built-in decay stays disabled."""
+    penalty = reference.new_zeros(())
+    for group in optimizer.param_groups:
+        decay = group["objective_weight_decay"]
+        if decay:
+            for parameter in group["params"]:
+                penalty = penalty + 0.5 * decay * parameter.square().sum()
+    return penalty
+
+
+def _smooth_objective(metrics: dict[str, torch.Tensor]) -> torch.Tensor:
+    return metrics["mse"] + metrics["smooth"] + metrics["jacobian"] + metrics["weight_decay"]
+
+
+def _alternating_proximal_step(
+    optimizer: torch.optim.Optimizer,
+    evaluate: Callable[[bool], dict[str, torch.Tensor]],
+    gate_regularizers: tuple[
+        tuple[torch.Tensor, NGCRegularizer | ExogenousGroupRegularizer], ...
+    ],
+) -> dict[str, torch.Tensor]:
+    """Adam coefficient/intercept update, then Euclidean gate prox.
+
+    Evaluate once per active block to get its gradient; never evaluate trial
+    steps or change learning rates. Log all loss components from the initial
+    same-batch state, without an extra forward pass solely for logging.
+    """
+    coefficient_group, gate_group, intercept_group = optimizer.param_groups
+    blocks = ((coefficient_group, intercept_group), (gate_group,))
+    metrics = evaluate(True)
+    logged = {name: value.detach() for name, value in metrics.items()}
+    diagnostics = {name: metrics["loss"].new_zeros(()) for name in _OPTIMIZATION_METRICS[1:]}
+    for block_index, groups in enumerate(blocks):
+        parameters = [parameter for group in groups for parameter in group["params"]]
+        if not parameters:
+            continue
+        smooth = _smooth_objective(metrics)
+        gradients = (torch.autograd.grad(smooth, parameters, allow_unused=True)
+                     if smooth.requires_grad else (None,) * len(parameters))
+        gradients = [torch.zeros_like(parameter) if gradient is None else gradient.detach()
+                     for parameter, gradient in zip(parameters, gradients)]
+        finite = torch.stack([torch.isfinite(metrics["loss"])] +
+                             [torch.isfinite(gradient).all() for gradient in gradients]).all()
+        if not finite:
+            raise FloatingPointError("non-finite loss or gradient in fixed-step proximal update")
+        step_size = groups[0]["lr"]
+        with torch.no_grad():
+            # Only the small gate block needs a copy to measure the proximal
+            # residual. No full-network copies or FP64 reductions are needed.
+            originals = [parameter.clone() for parameter in parameters] if block_index == 1 else []
+            if block_index == 0:
+                optimizer.zero_grad(set_to_none=True)
+                for parameter, gradient in zip(parameters, gradients):
+                    parameter.grad = gradient
+                optimizer.step()  # Gate gradients are None: no Adam gate update.
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                for parameter, gradient in zip(parameters, gradients):
+                    parameter.add_(gradient, alpha=-step_size)
+            if block_index == 1:
+                for gate, regularizer in gate_regularizers:
+                    if gate.requires_grad:
+                        regularizer.prox_(gate, step_size, nonnegative=True)
+                residual = sum((parameter - original).square().sum()
+                               for parameter, original in zip(parameters, originals)).sqrt() / step_size
+            else:
+                residual = torch.linalg.vector_norm(torch.stack([
+                    torch.linalg.vector_norm(gradient) for gradient in gradients
+                ]))
+        name = "coefficient" if block_index == 0 else "gate"
+        diagnostics[f"{name}_step_size"] = metrics["loss"].new_tensor(step_size)
+        residual_name = ("coefficient_gradient_norm" if block_index == 0
+                         else "gate_proximal_gradient_norm")
+        diagnostics[residual_name] = residual
+        if block_index == 0 and gate_group["params"]:
+            metrics = evaluate(True)
+    logged.update(diagnostics)
+    optimizer.zero_grad(set_to_none=True)
+    return logged
 
 
 def _to_torch_dataset(
@@ -255,7 +333,7 @@ def _epoch(
     dataset: _TorchLaggedDataset,
     config: GSEVARTrainingConfig,
     optimizer: torch.optim.Optimizer | None,
-    ngc: NGCRegularizer | OwnOtherSparseGroupRegularizer,
+    ngc: NGCRegularizer,
     criterion: nn.Module,
     device: torch.device,
     rng: np.random.Generator,
@@ -263,11 +341,8 @@ def _epoch(
     train = optimizer is not None
     model.train(train)
     totals = {
-        "loss": torch.zeros((), device=device),
-        "mse": torch.zeros((), device=device),
-        "ngc": torch.zeros((), device=device),
-        "smooth": torch.zeros((), device=device),
-        "jacobian": torch.zeros((), device=device),
+        name: torch.zeros((), device=device)
+        for name in ("loss", "mse", "ngc", "smooth", "jacobian", *_OPTIMIZATION_METRICS)
     }
     n_batches = 0
     use_smoothness = config.lambda_smooth != 0
@@ -282,81 +357,42 @@ def _epoch(
     ):
         inputs = dataset.predictors[batch_idx]
         targets = dataset.responses[batch_idx]
-        if use_jacobian:
-            # Prediction and structural sparsity retain their normal gate
-            # gradients.  Only the Jacobian regularizer treats the gate as
-            # fixed, preventing edge deletion from being a shortcut to J=C.
-            preds, coeffs = model(inputs)
-            mismatch = model.coefficient_jacobian_mismatch_for_regularization(
-                inputs,
-                create_graph=train,
-            )
-            jacobian = config.lambda_jacobian * mismatch.pow(2).mean()
-        else:
-            preds, coeffs = model(inputs)
-            jacobian = preds.new_zeros(())
-        mse = criterion(preds, targets)
-
-        if use_smoothness:
-            time_index = dataset.time_index[batch_idx]
-            smooth = config.lambda_smooth * temporal_smoothness_penalty(
-                coeffs,
-                time_index,
-                mode=config.smoothness_mode,
-                eps=config.smoothness_eps,
-            )
-        else:
-            smooth = mse.new_zeros(())
-
         if model.causal_gate is None:
             raise RuntimeError("NGC regularization requires use_causal_gate=True")
-        ngc_penalty = ngc.penalty(model.causal_gate)
 
-        if config.optimizer == "ista" and train:
-            loss = mse + smooth + jacobian
-            logged_loss = loss + ngc_penalty.detach()
-        else:
-            loss = mse + smooth + jacobian + ngc_penalty
-            logged_loss = loss
+        def evaluate(create_graph: bool) -> dict[str, torch.Tensor]:
+            with torch.set_grad_enabled(create_graph):
+                preds, coeffs = model(inputs)
+                mse = criterion(preds, targets)
+                smooth = (config.lambda_smooth * temporal_smoothness_penalty(
+                    coeffs, dataset.time_index[batch_idx],
+                    mode=config.smoothness_mode, eps=config.smoothness_eps,
+                ) if use_smoothness else mse.new_zeros(()))
+                if use_jacobian:
+                    # Preserve the gate-detached Jacobian regularizer.
+                    mismatch = model.coefficient_jacobian_mismatch_for_regularization(
+                        inputs, create_graph=create_graph,
+                    )
+                    jacobian = config.lambda_jacobian * mismatch.pow(2).mean()
+                else:
+                    jacobian = mse.new_zeros(())
+                penalty = ngc.penalty(model.causal_gate)
+                decay = (_weight_decay_penalty(optimizer, mse) if optimizer is not None
+                         else config.coefficient_weight_decay * 0.5 * sum(
+                             (parameter.square().sum() for parameter in model.coeff_net.parameters()
+                              if parameter.requires_grad), mse.new_zeros(())))
+                return dict(loss=mse + smooth + jacobian + penalty + decay,
+                            mse=mse, smooth=smooth, jacobian=jacobian,
+                            ngc=penalty, weight_decay=decay)
 
         if train:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            if config.optimizer == "ista":
-                if model.causal_gate is None:
-                    raise RuntimeError("ISTA requires use_causal_gate=True")
-                ngc.prox_(
-                    model.causal_gate,
-                    config.learning_rate,
-                    nonnegative=True,
-                )
-                ngc_penalty = ngc.penalty(model.causal_gate)
-                logged_loss = (
-                    mse.detach()
-                    + smooth.detach()
-                    + jacobian.detach()
-                    + ngc_penalty.detach()
-                )
-            else:
-                # Adam optimizes the regularized objective directly. Projection
-                # maintains the structural interpretation of the gate without
-                # replacing the exact-zero role of ISTA.
-                model.project_causal_gate_()
-                ngc_penalty = ngc.penalty(model.causal_gate)
-                logged_loss = (
-                    mse.detach()
-                    + smooth.detach()
-                    + jacobian.detach()
-                    + ngc_penalty.detach()
-                )
-
-        totals["loss"] = totals["loss"] + logged_loss.detach()
-        totals["mse"] = totals["mse"] + mse.detach()
-        totals["ngc"] = totals["ngc"] + ngc_penalty.detach()
-        totals["smooth"] = totals["smooth"] + smooth.detach()
-        totals["jacobian"] = totals["jacobian"] + jacobian.detach()
+            metrics = _alternating_proximal_step(
+                optimizer, evaluate, ((model.causal_gate, ngc),),
+            )
+        else:
+            metrics = evaluate(False)
+        for name in totals:
+            totals[name] += metrics.get(name, totals[name].new_zeros(())).detach()
         n_batches += 1
 
     return {
@@ -368,11 +404,10 @@ def _epoch(
 @torch.no_grad()
 def _gate_usage(
     model: GSEVAR,
-    threshold: float,
 ) -> tuple[float, int, int]:
     if model.causal_gate is None:
         return 0.0, 0, 0
-    graph = model.causal_graph_from_gate(threshold=threshold)
+    graph = model.causal_graph_from_gate()
     active = int(graph.sum().detach().cpu())
     total = graph.numel()
     return 100.0 * active / max(total, 1), active, total
@@ -391,10 +426,7 @@ def _log_epoch(
     if epoch != 1 and epoch != config.max_epochs and epoch % log_every != 0:
         return
 
-    usage_pct, active_edges, total_edges = _gate_usage(
-        model,
-        config.causal_threshold,
-    )
+    usage_pct, active_edges, total_edges = _gate_usage(model)
     log_fn(
         f"Epoch {epoch:>4}/{config.max_epochs:<4} | "
         f"loss={metrics['loss']:.6g} | "
@@ -402,6 +434,9 @@ def _log_epoch(
         f"ngc={metrics['ngc']:.6g} | "
         f"smooth={metrics['smooth']:.6g} | "
         f"jacobian={metrics['jacobian']:.6g} | "
+        f"l2={metrics['weight_decay']:.6g} | "
+        f"gate_step={metrics['gate_step_size']:.3g} | "
+        f"gate_residual={metrics['gate_proximal_gradient_norm']:.3g} | "
         f"active_edges={active_edges}/{total_edges} ({usage_pct:.2f}%)"
     )
 
@@ -426,12 +461,7 @@ def _infer(
         coeffs_t,
         aggregation=config.strength_aggregation,
     )
-    if model.causal_gate is not None:
-        graph_t = model.causal_graph_from_gate(
-            threshold=config.causal_threshold,
-        )
-    else:
-        graph_t = (strength_t > config.causal_threshold).to(torch.int64)
+    graph_t = model.causal_graph_from_gate()
     return coeffs_t.numpy(), strength_t.numpy(), graph_t.cpu().numpy()
 
 
@@ -439,8 +469,15 @@ def fit_gse_var(
     data: np.ndarray | list[np.ndarray],
     config: GSEVARTrainingConfig,
     model: GSEVAR | None = None,
+    *,
+    epoch_callback: Callable[[int, GSEVAR, dict[str, float]], None] | None = None,
 ) -> GSEVARFitResult:
-    """Fit GSE-VAR with gated, structured Granger sparsity."""
+    """Fit GSE-VAR; optional callbacks observe the post-update epoch state.
+
+    Adam updates coefficients/intercept; a nonnegative proximal step updates
+    gates. The algorithm and zero-only graph selection are fixed, not options.
+    Validation checkpoint selection remains the caller's responsibility.
+    """
     _validate_config(config)
     if config.seed is not None:
         np.random.seed(config.seed)
@@ -458,7 +495,6 @@ def fit_gse_var(
             num_hidden_layers=config.num_hidden_layers,
             use_causal_gate=True,
             gate_init=config.gate_init,
-            fit_intercept=config.fit_intercept,
         )
     model.to(device)
 
@@ -472,8 +508,8 @@ def fit_gse_var(
         raise ValueError(
             f"model num_vars {model.num_vars} does not match data num_vars {num_vars}"
         )
-    if (getattr(model, "intercept", None) is not None) != config.fit_intercept:
-        raise ValueError("model fit_intercept does not match config fit_intercept")
+    if model.intercept is None:
+        raise ValueError("GSE-VAR requires an intercept")
     # A caller may pass a manually modified model. Project before the first
     # forward pass so negative gates can never alter input signs.
     model.project_causal_gate_()
@@ -483,11 +519,7 @@ def fit_gse_var(
     criterion = nn.MSELoss(reduction="mean")
     rng = np.random.default_rng(config.seed)
     history: dict[str, list[float]] = {
-        "loss": [],
-        "mse": [],
-        "ngc": [],
-        "smooth": [],
-        "jacobian": [],
+        name: [] for name in ("loss", "mse", "ngc", "smooth", "jacobian", *_OPTIMIZATION_METRICS)
     }
     dataset = _to_torch_dataset(dataset_np, device)
 
@@ -505,6 +537,8 @@ def fit_gse_var(
         for key, value in metrics.items():
             history[key].append(value)
         _log_epoch(epoch, config, metrics, model)
+        if epoch_callback is not None:
+            epoch_callback(epoch, model, metrics)
 
     coeffs, strength, graph = _infer(model, dataset, config, device)
     return GSEVARFitResult(
@@ -513,5 +547,4 @@ def fit_gse_var(
         coeffs=coeffs,
         causal_strength=strength,
         causal_graph=graph,
-        causal_threshold=config.causal_threshold,
     )

@@ -10,12 +10,14 @@ from gse_var import (
     construct_varx_lagged_dataset, fit_gse_varx,
 )
 import gse_var.varx as varx
+from gse_var.training import _OPTIMIZATION_METRICS
 
 
 METRICS = (
     "loss", "mse", "ngc", "ngc_endogenous", "ngc_exogenous", "smooth",
     "smooth_endogenous", "smooth_exogenous", "jacobian", "jacobian_endogenous",
     "jacobian_exogenous",
+    *_OPTIMIZATION_METRICS,
 )
 
 
@@ -80,7 +82,7 @@ def test_patience_and_restore_all_weights_before_inference(monkeypatch, packed, 
     np.testing.assert_array_equal(result.endogenous_coeffs, yc.numpy())
     np.testing.assert_array_equal(result.exogenous_coeffs, xc.numpy())
     np.testing.assert_array_equal(result.exogenous_graph,
-                                  result.model.exogenous_graph_from_gate(config.causal_threshold).numpy())
+                                  result.model.exogenous_graph_from_gate().numpy())
     assert result.endogenous_coeffs.shape[0] == 10  # never append validation responses
 
 

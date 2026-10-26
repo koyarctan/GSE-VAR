@@ -12,9 +12,9 @@ from gse_var import (
 from gse_var.models import LagwiseMLP
 
 
-def make_model(varx, order=3, layers=2, fit_intercept=True, gate_init=1.0):
+def make_model(varx, order=3, layers=2, gate_init=1.0):
     common = dict(order=order, hidden_layer_size=5, num_hidden_layers=layers,
-                  fit_intercept=fit_intercept, gate_init=gate_init)
+                  gate_init=gate_init)
     if varx:
         return GSEVARX(num_endogenous=3, num_exogenous=2, exog_order=2,
                        include_current_exog=True, **common)
@@ -46,12 +46,11 @@ def assert_persistence(model, inputs, varx):
 @pytest.mark.parametrize("varx", [False, True])
 @pytest.mark.parametrize("order", [1, 3])
 @pytest.mark.parametrize("layers", [1, 2])
-@pytest.mark.parametrize("fit_intercept", [False, True])
 def test_default_predictions_copy_only_the_most_recent_observation(
-    varx, order, layers, fit_intercept,
+    varx, order, layers,
 ):
     torch.manual_seed(142)
-    model = make_model(varx, order, layers, fit_intercept)
+    model = make_model(varx, order, layers)
     assert_persistence(model, make_inputs(varx, order), varx)
 
 
@@ -105,7 +104,7 @@ def test_zero_output_weights_do_not_freeze_hidden_layers_or_gates(varx):
 
 
 @pytest.mark.parametrize("varx", [False, True])
-def test_fit_initial_mse_matches_persistence_without_a_manual_model(varx):
+def test_first_logged_mse_matches_pre_update_persistence(varx):
     rng = np.random.default_rng(145)
     y = rng.normal(size=(15, 3)).astype("float32") + np.array([8, -3, 2], dtype="float32")
     x = rng.normal(size=(15, 2)).astype("float32")

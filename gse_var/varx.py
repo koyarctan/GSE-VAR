@@ -12,17 +12,20 @@ from torch import nn
 from .data import VARXLaggedDataset, construct_varx_lagged_dataset
 from .models import GSEVARX
 from .regularizers import (
-    ExogenousGroupRegularizer, NGCRegularizer, OwnOtherSparseGroupRegularizer,
+    ExogenousGroupRegularizer, NGCRegularizer,
     RegularizerName,
 )
 from .exogenous import ExogenousLayout
 from .training import (
     GSEVARTrainingConfig,
+    _OPTIMIZATION_METRICS,
+    _alternating_proximal_step,
     _iter_batches,
     _make_endogenous_regularizer,
     _make_gated_optimizer,
     _resolve_device,
     _validate_config,
+    _weight_decay_penalty,
     temporal_smoothness_penalty,
 )
 
@@ -66,7 +69,6 @@ class GSEVARXFitResult:
     exogenous_lags: np.ndarray | None = None
     exogenous_layout: ExogenousLayout | None = None
     endogenous_names: tuple[str, ...] | None = None
-    causal_threshold: float = 0.0
     exogenous_term_graph: np.ndarray | None = None
     best_epoch: int | None = None
     best_validation_mse: float | None = None
@@ -75,9 +77,8 @@ class GSEVARXFitResult:
     stopped_epoch: int | None = None
 
     @property
-    def intercept(self) -> np.ndarray | None:
-        parameter = getattr(self.model, "intercept", None)
-        return None if parameter is None else parameter.detach().cpu().numpy().copy()
+    def intercept(self) -> np.ndarray:
+        return self.model.intercept.detach().cpu().numpy().copy()
 
     @property
     def exogenous_source_names(self):
@@ -91,7 +92,7 @@ class GSEVARXFitResult:
     @property
     def exogenous_graph_by_lag(self):
         gate = self.exogenous_gate_by_lag
-        return np.where(np.isfinite(gate), (gate > self.causal_threshold).astype(float), np.nan)
+        return np.where(np.isfinite(gate), (gate != 0).astype(float), np.nan)
 
     @property
     def exogenous_coeffs_by_lag(self):
@@ -314,7 +315,7 @@ def _make_regularizers(
     config: GSEVARXTrainingConfig,
     layout: ExogenousLayout | None = None,
 ) -> tuple[
-    NGCRegularizer | OwnOtherSparseGroupRegularizer,
+    NGCRegularizer,
     NGCRegularizer | ExogenousGroupRegularizer,
 ]:
     endogenous_regularizer = _make_endogenous_regularizer(config)
@@ -333,7 +334,7 @@ def _epoch(
     dataset: _TorchVARXLaggedDataset,
     config: GSEVARXTrainingConfig,
     optimizer: torch.optim.Optimizer,
-    endogenous_regularizer: NGCRegularizer | OwnOtherSparseGroupRegularizer,
+    endogenous_regularizer: NGCRegularizer,
     exogenous_regularizer: NGCRegularizer | ExogenousGroupRegularizer,
     criterion: nn.Module,
     device: torch.device,
@@ -352,6 +353,7 @@ def _epoch(
         "jacobian",
         "jacobian_endogenous",
         "jacobian_exogenous",
+        *_OPTIMIZATION_METRICS,
     )
     totals = {
         name: torch.zeros((), device=device)
@@ -380,117 +382,54 @@ def _epoch(
         endogenous_inputs = dataset.endogenous_predictors[batch_idx]
         exogenous_inputs = dataset.exogenous_predictors[batch_idx]
         targets = dataset.responses[batch_idx]
-        predictions, endogenous_coeffs, exogenous_coeffs = model(
-            endogenous_inputs,
-            exogenous_inputs,
-        )
-        mse = criterion(predictions, targets)
-
         time_index = dataset.time_index[batch_idx]
-        if config.lambda_smooth != 0:
-            smooth_endogenous = (
-                config.lambda_smooth
-                * temporal_smoothness_penalty(
-                    endogenous_coeffs,
-                    time_index,
-                    mode=config.smoothness_mode,
-                    eps=config.smoothness_eps,
+
+        def evaluate(create_graph: bool) -> dict[str, torch.Tensor]:
+            with torch.set_grad_enabled(create_graph):
+                predictions, endogenous_coeffs, exogenous_coeffs = model(
+                    endogenous_inputs, exogenous_inputs,
                 )
-            )
-        else:
-            smooth_endogenous = mse.new_zeros(())
-        if exogenous_smoothness_weight != 0:
-            smooth_exogenous = (
-                exogenous_smoothness_weight
-                * temporal_smoothness_penalty(
-                    exogenous_coeffs,
-                    time_index,
-                    mode=config.smoothness_mode,
-                    eps=config.smoothness_eps,
+                mse = criterion(predictions, targets)
+                smooth_endogenous = (config.lambda_smooth * temporal_smoothness_penalty(
+                    endogenous_coeffs, time_index,
+                    mode=config.smoothness_mode, eps=config.smoothness_eps,
+                ) if config.lambda_smooth else mse.new_zeros(()))
+                smooth_exogenous = (exogenous_smoothness_weight * temporal_smoothness_penalty(
+                    exogenous_coeffs, time_index,
+                    mode=config.smoothness_mode, eps=config.smoothness_eps,
+                ) if exogenous_smoothness_weight else mse.new_zeros(()))
+                smooth = smooth_endogenous + smooth_exogenous
+                if use_jacobian:
+                    endogenous_mismatch, exogenous_mismatch = (
+                        model.coefficient_jacobian_mismatches_for_regularization(
+                            endogenous_inputs, exogenous_inputs, create_graph=create_graph,
+                        )
+                    )
+                    jacobian_endogenous = config.lambda_jacobian * endogenous_mismatch.pow(2).mean()
+                    jacobian_exogenous = exogenous_jacobian_weight * exogenous_mismatch.pow(2).mean()
+                else:
+                    jacobian_endogenous = mse.new_zeros(())
+                    jacobian_exogenous = mse.new_zeros(())
+                jacobian = jacobian_endogenous + jacobian_exogenous
+                ngc_endogenous = endogenous_regularizer.penalty(model.endogenous_gate)
+                ngc_exogenous = exogenous_regularizer.penalty(model.exogenous_gate)
+                ngc = ngc_endogenous + ngc_exogenous
+                decay = _weight_decay_penalty(optimizer, mse)
+                return dict(
+                    loss=mse + smooth + jacobian + ngc + decay, mse=mse,
+                    ngc=ngc, ngc_endogenous=ngc_endogenous, ngc_exogenous=ngc_exogenous,
+                    smooth=smooth, smooth_endogenous=smooth_endogenous,
+                    smooth_exogenous=smooth_exogenous,
+                    jacobian=jacobian, jacobian_endogenous=jacobian_endogenous,
+                    jacobian_exogenous=jacobian_exogenous, weight_decay=decay,
                 )
-            )
-        else:
-            smooth_exogenous = mse.new_zeros(())
-        smooth = smooth_endogenous + smooth_exogenous
 
-        if use_jacobian:
-            endogenous_mismatch, exogenous_mismatch = (
-                model.coefficient_jacobian_mismatches_for_regularization(
-                    endogenous_inputs,
-                    exogenous_inputs,
-                    create_graph=True,
-                )
-            )
-            jacobian_endogenous = (
-                config.lambda_jacobian
-                * endogenous_mismatch.pow(2).mean()
-            )
-            jacobian_exogenous = (
-                exogenous_jacobian_weight
-                * exogenous_mismatch.pow(2).mean()
-            )
-        else:
-            jacobian_endogenous = mse.new_zeros(())
-            jacobian_exogenous = mse.new_zeros(())
-        jacobian = jacobian_endogenous + jacobian_exogenous
-
-        ngc_endogenous = endogenous_regularizer.penalty(
-            model.endogenous_gate
-        )
-        ngc_exogenous = exogenous_regularizer.penalty(model.exogenous_gate)
-        ngc = ngc_endogenous + ngc_exogenous
-
-        differentiable_loss = mse + smooth + jacobian
-        if config.optimizer == "adam":
-            loss = differentiable_loss + ngc
-        else:
-            loss = differentiable_loss
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        if config.optimizer == "ista":
-            endogenous_regularizer.prox_(
-                model.endogenous_gate,
-                config.learning_rate,
-                nonnegative=True,
-            )
-            exogenous_regularizer.prox_(
-                model.exogenous_gate,
-                config.learning_rate,
-                nonnegative=True,
-            )
-        else:
-            model.project_causal_gates_()
-
-        ngc_endogenous = endogenous_regularizer.penalty(
-            model.endogenous_gate
-        )
-        ngc_exogenous = exogenous_regularizer.penalty(model.exogenous_gate)
-        ngc = ngc_endogenous + ngc_exogenous
-        logged_loss = (
-            mse.detach()
-            + smooth.detach()
-            + jacobian.detach()
-            + ngc.detach()
-        )
-
-        batch_metrics = {
-            "loss": logged_loss,
-            "mse": mse,
-            "ngc": ngc,
-            "ngc_endogenous": ngc_endogenous,
-            "ngc_exogenous": ngc_exogenous,
-            "smooth": smooth,
-            "smooth_endogenous": smooth_endogenous,
-            "smooth_exogenous": smooth_exogenous,
-            "jacobian": jacobian,
-            "jacobian_endogenous": jacobian_endogenous,
-            "jacobian_exogenous": jacobian_exogenous,
-        }
-        for name, value in batch_metrics.items():
-            totals[name] = totals[name] + value.detach()
+        batch_metrics = _alternating_proximal_step(optimizer, evaluate, (
+            (model.endogenous_gate, endogenous_regularizer),
+            (model.exogenous_gate, exogenous_regularizer),
+        ))
+        for name in totals:
+            totals[name] += batch_metrics.get(name, totals[name].new_zeros(())).detach()
         n_batches += 1
 
     return {
@@ -502,10 +441,9 @@ def _epoch(
 @torch.no_grad()
 def _gate_usage(
     model: GSEVARX,
-    threshold: float,
 ) -> tuple[int, int, int, int]:
-    endogenous_graph = model.endogenous_graph_from_gate(threshold)
-    exogenous_graph = model.exogenous_graph_from_gate(threshold)
+    endogenous_graph = model.endogenous_graph_from_gate()
+    exogenous_graph = model.exogenous_graph_from_gate()
     return (
         int(endogenous_graph.sum().cpu()),
         endogenous_graph.numel(),
@@ -528,7 +466,7 @@ def _log_epoch(
         return
 
     endogenous_active, endogenous_total, exogenous_active, exogenous_total = (
-        _gate_usage(model, config.causal_threshold)
+        _gate_usage(model)
     )
     validation_log = f"val_mse={metrics['val_mse']:.6g} | " if "val_mse" in metrics else ""
     log_fn(
@@ -538,6 +476,9 @@ def _log_epoch(
         f"ngc={metrics['ngc']:.6g} | "
         f"smooth={metrics['smooth']:.6g} | "
         f"jacobian={metrics['jacobian']:.6g} | "
+        f"l2={metrics['weight_decay']:.6g} | "
+        f"gate_step={metrics['gate_step_size']:.3g} | "
+        f"gate_residual={metrics['gate_proximal_gradient_norm']:.3g} | "
         f"{validation_log}"
         f"endog_edges={endogenous_active}/{endogenous_total} | "
         f"exog_edges={exogenous_active}/{exogenous_total}"
@@ -588,12 +529,8 @@ def _infer(
                 aggregation=config.strength_aggregation).squeeze(-1)
             for group in model.exogenous_layout.groups
         ], dim=-1)
-    endogenous_graph = model.endogenous_graph_from_gate(
-        config.causal_threshold
-    )
-    exogenous_graph = model.exogenous_graph_from_gate(
-        config.causal_threshold
-    )
+    endogenous_graph = model.endogenous_graph_from_gate()
+    exogenous_graph = model.exogenous_graph_from_gate()
     return (
         endogenous_t.numpy(),
         exogenous_t.numpy(),
@@ -672,7 +609,6 @@ def fit_gse_varx(
             gate_init=config.gate_init,
             exogenous_gate_init=config.exogenous_gate_init,
             exogenous_layout=dataset_np.exogenous_layout,
-            fit_intercept=config.fit_intercept,
         )
     if model.num_endogenous != num_endogenous:
         raise ValueError(
@@ -684,8 +620,8 @@ def fit_gse_varx(
         )
     if model.order != config.order:
         raise ValueError("model order does not match config order")
-    if (getattr(model, "intercept", None) is not None) != config.fit_intercept:
-        raise ValueError("model fit_intercept does not match config fit_intercept")
+    if model.intercept is None:
+        raise ValueError("GSE-VARX requires an intercept")
     if model.exogenous_layout != dataset_np.exogenous_layout:
         raise ValueError("model exogenous identities do not match the dataset layout")
     if endog_names is not None and len(endog_names) != num_endogenous:
@@ -716,6 +652,7 @@ def fit_gse_varx(
         "jacobian",
         "jacobian_endogenous",
         "jacobian_exogenous",
+        *_OPTIMIZATION_METRICS,
     )
     history = {name: [] for name in metric_names}
     if validation is not None:
@@ -786,8 +723,7 @@ def fit_gse_varx(
         exogenous_lags=dataset_np.exogenous_lags.copy(),
         exogenous_layout=dataset_np.exogenous_layout,
         endogenous_names=None if endog_names is None else tuple(endog_names),
-        causal_threshold=config.causal_threshold,
-        exogenous_term_graph=(model.exogenous_gate.detach().cpu().numpy()[0] > config.causal_threshold).astype(int)
+        exogenous_term_graph=model.exogenous_gate.detach().cpu().numpy()[0].astype(bool).astype(int)
         if dataset_np.exogenous_layout is not None else None,
         best_epoch=best_epoch,
         best_validation_mse=None if best_epoch is None else best_validation_mse,

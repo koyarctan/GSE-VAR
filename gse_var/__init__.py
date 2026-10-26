@@ -25,6 +25,8 @@ __all__ = [
     "GVARBaselineFitResult",
     "GVARBaselineTrainingConfig",
     "GSEVARTrainingConfig",
+    "GSEVARDisARM",
+    "GSEVARDisARMTrainingConfig",
     "GSEVAR",
     "JacobianAgreementResult",
     "LaggedDataset",
@@ -42,6 +44,7 @@ __all__ = [
     "fit_cmlp",
     "fit_gvar",
     "fit_gse_var",
+    "fit_gse_var_disarm",
     "fit_gse_varx",
     "group_lasso_penalty",
     "hierarchical_group_lasso_penalty",
@@ -55,6 +58,9 @@ __all__ = [
 ]
 
 _LAZY_ATTRS = {
+    "GSEVARDisARM": ("gse_var.disarm", "GSEVARDisARM"),
+    "GSEVARDisARMTrainingConfig": ("gse_var.disarm", "GSEVARDisARMTrainingConfig"),
+    "fit_gse_var_disarm": ("gse_var.disarm", "fit_gse_var_disarm"),
     "evaluate_coefficients": ("gse_var.prediction", "evaluate_coefficients"),
     "causal_gate_matrices": ("gse_var.visualization", "causal_gate_matrices"),
     "plot_causal_graph_matrix": ("gse_var.visualization", "plot_causal_graph_matrix"),

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-from typing import ClassVar, Literal
+from typing import Literal
 
 import torch
 
@@ -15,7 +14,6 @@ RegularizerName = Literal[
     "hierarchical_group_lasso",
 ]
 ReductionName = Literal["sum", "mean"]
-EndogenousGroupingName = Literal["own_other", "edge"]
 
 
 def _group_norms_by_pair(tensor: torch.Tensor, lag_dim: int) -> torch.Tensor:
@@ -261,60 +259,6 @@ def prox_nonnegative_hierarchical_group_lasso_(
         )
     param.clamp_(min=0.0)
     return prox_hierarchical_group_lasso_(param, lam, step_size, eps=eps)
-
-
-@dataclass(frozen=True)
-class OwnOtherSparseGroupRegularizer:
-    """Unweighted Sparse Own/Other penalty on endogenous structural gates.
-
-    Following VARX-L (Nicholson et al., 2017, Table 1, Eq. 7), each lag has
-    two disjoint groups: its diagonal (own) and off-diagonal (other) entries.
-    Elementwise L1 sparsity is followed by independent group shrinkage.
-    Unlike the paper, the groups have no cardinality multipliers and the
-    penalty acts on gates, not on linear coefficients. No own edge is forced
-    to remain and no arbitrary own/other penalty ratio is introduced.
-    """
-
-    sparse_l1_lambda: float = 0.0
-    sparse_group_lambda: float = 0.0
-    name: ClassVar[RegularizerName] = "sparse_group_lasso"
-    lam: ClassVar[float] = 0.0
-
-    def __post_init__(self):
-        for value in (self.sparse_l1_lambda, self.sparse_group_lambda):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError("sparse penalty strengths must be finite and non-negative")
-
-    @staticmethod
-    def _mask(tensor):
-        if tensor.ndim != 3 or tensor.shape[-2] != tensor.shape[-1]:
-            raise ValueError("own/other grouping expects [lag, target, source] with square matrices")
-        return torch.eye(tensor.shape[-1], dtype=torch.bool, device=tensor.device)
-
-    def penalty(self, tensor):
-        mask = self._mask(tensor)
-        group_norms = torch.linalg.vector_norm(tensor[:, mask], dim=-1)
-        if tensor.shape[-1] > 1:
-            group_norms = group_norms + torch.linalg.vector_norm(tensor[:, ~mask], dim=-1)
-        return (self.sparse_group_lambda * group_norms.sum()
-                + self.sparse_l1_lambda * tensor.abs().sum())
-
-    @torch.no_grad()
-    def prox_(self, param, step_size, *, nonnegative=False):
-        mask = self._mask(param)
-        if nonnegative:
-            prox_nonnegative_lasso_(param, self.sparse_l1_lambda, step_size)
-        else:
-            prox_lasso_(param, self.sparse_l1_lambda, step_size)
-        threshold = step_size * self.sparse_group_lambda
-        group_masks = (mask, ~mask) if param.shape[-1] > 1 else (mask,)
-        for group_mask in group_masks:
-            block = param[:, group_mask]
-            norms = torch.linalg.vector_norm(block, dim=-1, keepdim=True)
-            block.mul_((1 - threshold / norms.clamp(min=1e-12)).clamp(min=0))
-            block.masked_fill_(norms <= threshold, 0)
-            param[:, group_mask] = block
-        return param
 
 
 @dataclass(frozen=True)
