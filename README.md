@@ -258,8 +258,8 @@ and edit `DISARM_CONFIG`; use `GSE_METHOD="proximal"` and the preserved
 `MODEL_CONFIG` for the continuous proximal route. The single training cell keeps the
 same data, linear-SGL comparison, 100-epoch checkpoint selection and figures.
 It saves no learning results. Restart the kernel once after updating the
-embedded implementation. The full 11 experiment and notebooks 12/13 are not
-changed by this addition.
+embedded implementation. This older quick notebook is not the paper workflow.
+The current notebooks 11–13 automate tuning and final evaluation on Remote SSH.
 
 The public GSE configurations no longer accept `optimizer`, `fit_intercept`,
 or `causal_threshold`: remove these arguments from callers. Continuous training
@@ -268,10 +268,29 @@ models always include an intercept and an edge is selected iff any lag gate is
 nonzero. This preserves the retained algorithms' numerical updates, not the
 deleted SGD/direct-Adam variants. Checkpoints with intercept parameters keep
 their parameter keys and shapes. The quick Citi Bike notebook embeds the new
-implementation; restart its kernel after updating. Archived results and the
-frozen full-11, Lorenz96 and linear-VAR experiment notebooks are not rewritten.
+implementation; restart its kernel after updating. The current full notebooks
+11–13 use the repository implementation directly and evaluate both GSE variants.
 The quick notebook's helper source is `experiments/_citibike_quick_core.py`;
 its packed copy is checked against that source by the notebook tests.
+
+## Remote paper experiments (11–13)
+
+Notebook 11 uses seven US Google Trends queries and monthly US-nationality
+visitor counts from JNTO (2004–2019). Notebook 12 evaluates Lorenz96 structure
+recovery; notebook 13 evaluates structure/sign recovery on the GVAR paper's
+linear VAR. Both synthetic experiments retain T=250 and 500.
+
+Copy the project, including `experiments/paper_experiments/` and `data/`, to the
+remote server. Install `python -m pip install -e '.[experiments]'` in the CUDA
+environment; the notebooks do not reinstall PyTorch. They automate independent
+tuning and freeze settings before final evaluation; no manual quick sweep is
+required. See `experiments/README.md` for tmux commands and result formats.
+
+Every fit records configuration, source/environment hashes, numerical arrays,
+full GSE histories, and 100-epoch model checkpoints. Final evaluation arrays
+include all predictions, effective coefficients, Jacobians, gate support and
+DisARM probabilities. CSV/JSON/NPZ allow later plots without retraining; an
+independent plotting entry point also exports PDF/PNG/SVG and long-form tables.
 
 ## Default initialization
 

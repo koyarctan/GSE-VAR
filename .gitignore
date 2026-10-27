@@ -12,6 +12,7 @@ build/
 slides/*
 figures/*
 data/*
+results/
 experiments/*
 REFACTORING_RULES.md
 .agents/*

@@ -23,6 +23,13 @@ Repository = "https://github.com/koyarctan/GSE-VAR"
 
 
 [project.optional-dependencies]
+experiments = [
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "ipykernel>=6",
+    "nbconvert>=7",
+]
+
 viz = [
     "matplotlib>=3.7",
 ]
