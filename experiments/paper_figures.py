@@ -75,7 +75,7 @@ def favorita_path_diagram(data,output):
         if edge['lag_days']!=1:label+='（'+str(edge['lag_days'])+'日前）'
         lines.append(r'\draw['+style+'] ('+positions[source][0]+'.'+start+') -- node['+where+',font=\\footnotesize,fill=white,inner sep=1pt,text='+color+'] {'+label+'} ('+positions[target][0]+'.'+end+');')
     lines.append(r'\end{tikzpicture}')
-    (output/'favorita_paths.tex').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    (output/'favorita_paths.tex').write_text('% !TeX root = ../main.tex\n'+'\n'.join(lines)+'\n',encoding='utf-8')
     with (output/'favorita_paths.csv').open('w',encoding='utf-8',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=list(edges[0]));writer.writeheader();writer.writerows(edges)
 

@@ -2,14 +2,18 @@
 \RequirePackage{iftex}
 \ifLuaTeX
   \documentclass[a4paper,11pt]{ltjsarticle}
-  \usepackage[haranoaji,deluxe]{luatexja-preset}
+  \usepackage{luatexja-fontspec}
+  \defaultjfontfeatures{Scale=0.924715,Kerning=Off,Script=CJK,CJKShape=JIS2004,
+    YokoFeatures={JFM=ujis},TateFeatures={JFM=ujisv}}
+  \setmainjfont[BoldFont=HaranoAjiMincho-Bold.otf]{HaranoAjiMincho-Regular.otf}
+  \setsansjfont[BoldFont=HaranoAjiGothic-Bold.otf]{HaranoAjiGothic-Regular.otf}
 \else
   \documentclass[a4paper,11pt,xelatex,ja=standard,jafont=haranoaji]{bxjsarticle}
 \fi
 \usepackage{geometry}
 \geometry{margin=25mm}
-\usepackage{amsmath,amssymb,amsthm,bm}
 \usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,bm}
 \usepackage{booktabs,tabularx,array,graphicx,tikz}
 \usetikzlibrary{arrows.meta,positioning,calc}
 \usepackage{algorithm,algpseudocode}
