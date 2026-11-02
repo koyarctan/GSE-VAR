@@ -173,7 +173,7 @@ def evaluate_jacobian_agreement(
     """
     if model.causal_gate is None:
         raise ValueError(
-            "evaluate_jacobian_agreement requires use_causal_gate=True"
+            "evaluate_jacobian_agreement requires a binary-gated GSE-VAR"
         )
     _validate_metric_options(batch_size, active_threshold, zero_tolerance)
 

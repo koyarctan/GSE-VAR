@@ -7,10 +7,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from gse_var import GSEVAR, GSEVARDisARM, GSEVARDisARMTrainingConfig, fit_gse_var_disarm
-from gse_var.disarm import (
-    _antithetic_masks, _disarm_gradient, _disarm_step, _masked_losses, _smoothness_losses,
-)
+from gse_var import GSEVAR, GSEVARTrainingConfig, fit_gse_var
+from gse_var.disarm import _antithetic_masks, _disarm_gradient
+from gse_var.training import _disarm_step, _masked_losses, _smoothness_losses
 from gse_var.training import temporal_smoothness_penalty
 
 
@@ -119,11 +118,11 @@ def test_smoothness_scalar_and_parameter_gradient_match_existing_objective(mode,
 @pytest.mark.parametrize("mode", ["absolute", "relative"])
 def test_target_score_losses_keep_global_mean_scaling_and_coupled_relative_penalty(mode):
     torch.manual_seed(18)
-    model = GSEVARDisARM(3, 2, 4)
+    model = GSEVAR(3, 2, 4)
     with torch.no_grad():
         for parameter in model.coeff_net.parameters():
             parameter.uniform_(-.3, .3)
-    config = GSEVARDisARMTrainingConfig(order=2, hidden_layer_size=4,
+    config = GSEVARTrainingConfig(order=2, hidden_layer_size=4,
         lambda_smooth=.13, lambda_jacobian=.07, smoothness_mode=mode, verbose=0)
     inputs, targets, times = torch.randn(5, 2, 3), torch.randn(5, 3), torch.tensor([9, 6, 7, 2, 3])
     mask = torch.ones_like(model.causal_gate)
@@ -154,12 +153,12 @@ def test_target_score_losses_keep_global_mean_scaling_and_coupled_relative_penal
 
 def test_unrelated_targets_do_not_change_target_gate_update_for_absolute_smoothness():
     torch.manual_seed(19)
-    model = GSEVARDisARM(2, 2, 3, gate_probability_init=.6)
+    model = GSEVAR(2, 2, 3, gate_probability_init=.6)
     with torch.no_grad():
         for parameter in model.coeff_net.parameters():
             parameter.uniform_(-.4, .4)
     reference = pickle.loads(pickle.dumps(model))
-    config = GSEVARDisARMTrainingConfig(order=2, hidden_layer_size=3,
+    config = GSEVARTrainingConfig(order=2, hidden_layer_size=3,
         lambda_l0=.01, lambda_smooth=.03, lambda_jacobian=.02,
         learning_rate=.05, verbose=0)
     inputs, targets, times = torch.randn(5, 2, 2), torch.randn(5, 2), torch.arange(5)
@@ -173,27 +172,27 @@ def test_unrelated_targets_do_not_change_target_gate_update_for_absolute_smoothn
     assert not torch.equal(model.gate_logits[:, 1, :], reference.gate_logits[:, 1, :])
 
 
-def test_binary_masks_preserve_the_existing_prediction_formula_and_initialization():
+def test_binary_masks_use_persistence_initialization_and_exclude_both_input_paths():
     torch.manual_seed(7)
-    reference = GSEVAR(3, 2, 4)
-    torch.manual_seed(7)
-    model = GSEVARDisARM(3, 2, 4)
+    model = GSEVAR(3, 2, 4)
     inputs = torch.randn(5, 2, 3)
-    for actual, expected in zip(model(inputs), reference(inputs)):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    prediction, coefficients = model(inputs)
+    expected = torch.zeros_like(coefficients)
+    expected[:, -1] = torch.eye(3)
+    torch.testing.assert_close(coefficients, expected, rtol=0, atol=0)
+    torch.testing.assert_close(prediction, inputs[:, -1], rtol=0, atol=0)
+    torch.testing.assert_close(model.intercept, torch.zeros(3), rtol=0, atol=0)
     assert "causal_gate" not in dict(model.named_parameters())
     assert "causal_gate" in dict(model.named_buffers())
     assert torch.allclose(model.gate_probabilities, torch.full_like(model.causal_gate, .9))
     mask = torch.ones_like(model.causal_gate)
     mask[:, 1, 0] = 0
     model.causal_gate.copy_(mask)
-    reference.causal_gate.data.copy_(mask)
     with torch.no_grad():
         for parameter in model.coeff_net.parameters():
             parameter.uniform_(-.3, .3)
-        reference.coeff_net.load_state_dict(model.coeff_net.state_dict())
-    for actual, expected in zip(model.forward_with_mask(inputs, mask), reference(inputs)):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for sampled, fixed in zip(model.forward_with_mask(inputs, mask), model(inputs)):
+        torch.testing.assert_close(sampled, fixed, rtol=0, atol=0)
     changed = inputs.clone()
     changed[:, :, 0] += 10
     torch.testing.assert_close(model(changed)[0][:, 1], model(inputs)[0][:, 1], rtol=0, atol=0)
@@ -203,7 +202,7 @@ def test_binary_masks_preserve_the_existing_prediction_formula_and_initializatio
 
 
 def test_masked_forward_never_mutates_the_deterministic_inference_mask():
-    model = GSEVARDisARM(2, 1, 3)
+    model = GSEVAR(2, 1, 3)
     original = model.causal_gate.clone()
     model.forward_with_mask(torch.randn(4, 1, 2), torch.zeros_like(original))
     torch.testing.assert_close(model.causal_gate, original)
@@ -212,11 +211,11 @@ def test_masked_forward_never_mutates_the_deterministic_inference_mask():
 
 
 def test_unused_gates_follow_analytic_expected_l0_gradient_and_only_two_forwards():
-    model = GSEVARDisARM(2, 2, 3, gate_probability_init=.7)
+    model = GSEVAR(2, 2, 3, gate_probability_init=.7)
     with torch.no_grad():
         for parameter in model.coeff_net.parameters():
             parameter.zero_()
-    config = GSEVARDisARMTrainingConfig(order=2, hidden_layer_size=3, learning_rate=.2,
+    config = GSEVARTrainingConfig(order=2, hidden_layer_size=3, learning_rate=.2,
                                        lambda_l0=.4, verbose=0)
     initial = model.gate_logits.detach().clone()
     generator = torch.Generator().manual_seed(4)
@@ -237,12 +236,12 @@ def test_unused_gates_follow_analytic_expected_l0_gradient_and_only_two_forwards
 @pytest.mark.parametrize("smoothness_mode", ["absolute", "relative"])
 def test_coefficient_update_averages_both_masks_and_applies_l2_exactly_once(smoothness_mode):
     torch.manual_seed(17)
-    model = GSEVARDisARM(2, 1, 3, gate_probability_init=.6)
+    model = GSEVAR(2, 1, 3, gate_probability_init=.6)
     with torch.no_grad():
         for parameter in model.coeff_net.parameters():
             parameter.uniform_(-.3, .3)
     reference = pickle.loads(pickle.dumps(model))
-    config = GSEVARDisARMTrainingConfig(order=1, hidden_layer_size=3, learning_rate=.02,
+    config = GSEVARTrainingConfig(order=1, hidden_layer_size=3, learning_rate=.02,
         lambda_smooth=.03, lambda_jacobian=.02, coefficient_weight_decay=.4,
         smoothness_mode=smoothness_mode, verbose=0)
     inputs, targets, times = torch.randn(5, 1, 2), torch.randn(5, 2), torch.arange(5)
@@ -265,7 +264,7 @@ def test_coefficient_update_averages_both_masks_and_applies_l2_exactly_once(smoo
 @pytest.mark.parametrize("smoothness_mode", ["absolute", "relative"])
 def test_fit_supports_regularizers_and_callbacks_use_the_fixed_mask(smoothness_mode):
     data = np.random.default_rng(123).normal(size=(13, 2)).astype("float32")
-    config = GSEVARDisARMTrainingConfig(order=2, hidden_layer_size=3, max_epochs=3,
+    config = GSEVARTrainingConfig(order=2, hidden_layer_size=3, max_epochs=3,
         batch_size=5, lambda_smooth=.02, lambda_jacobian=.01, coefficient_weight_decay=.03,
         smoothness_mode=smoothness_mode, verbose=0, device="cpu")
     callbacks = []
@@ -274,12 +273,12 @@ def test_fit_supports_regularizers_and_callbacks_use_the_fixed_mask(smoothness_m
         assert metrics["loss"] == pytest.approx(sum(metrics[key] for key in
             ("mse", "smooth", "jacobian", "weight_decay", "l0")), rel=1e-5)
         callbacks.append(epoch)
-    result = fit_gse_var_disarm(data, config, epoch_callback=callback)
+    result = fit_gse_var(data, config, epoch_callback=callback)
     assert callbacks == [1, 2, 3]
     assert all(len(values) == 3 and np.isfinite(values).all() for values in result.history.values())
     assert result.coeffs.shape == (11, 2, 2, 2)
     np.testing.assert_array_equal(result.causal_graph, result.model.causal_gate.bool().any(0).numpy())
-    restored = GSEVARDisARM(2, 2, 3)
+    restored = GSEVAR(2, 2, 3)
     restored.load_state_dict(result.model.state_dict())
     inputs = torch.randn(4, 2, 2)
     torch.testing.assert_close(restored(inputs)[0], result.model(inputs)[0], rtol=0, atol=0)
@@ -289,9 +288,9 @@ def test_fit_supports_regularizers_and_callbacks_use_the_fixed_mask(smoothness_m
 
 def test_seeded_fit_is_reproducible_with_minibatches():
     data = np.random.default_rng(4).normal(size=(12, 2))
-    config = GSEVARDisARMTrainingConfig(order=2, hidden_layer_size=3, max_epochs=4,
+    config = GSEVARTrainingConfig(order=2, hidden_layer_size=3, max_epochs=4,
                                        batch_size=4, shuffle=True, verbose=0, device="cpu")
-    first, second = fit_gse_var_disarm(data, config), fit_gse_var_disarm(data, config)
+    first, second = fit_gse_var(data, config), fit_gse_var(data, config)
     assert first.history == second.history
     for key in first.model.state_dict():
         torch.testing.assert_close(first.model.state_dict()[key], second.model.state_dict()[key], rtol=0, atol=0)
@@ -303,14 +302,14 @@ def test_seeded_fit_is_reproducible_with_minibatches():
     ("max_epochs", 0), ("batch_size", 0),
 ])
 def test_invalid_disarm_config_is_rejected(field, value):
-    config = replace(GSEVARDisARMTrainingConfig(order=1, hidden_layer_size=2), **{field: value})
+    config = replace(GSEVARTrainingConfig(order=1, hidden_layer_size=2), **{field: value})
     with pytest.raises(ValueError, match=field):
-        fit_gse_var_disarm(np.zeros((5, 2)), config)
+        fit_gse_var(np.zeros((5, 2)), config)
 
 
 def test_nonfinite_gradient_is_rejected_without_parameter_update():
-    model = GSEVARDisARM(2, 1, 3)
-    config = GSEVARDisARMTrainingConfig(order=1, hidden_layer_size=3, verbose=0)
+    model = GSEVAR(2, 1, 3)
+    config = GSEVARTrainingConfig(order=1, hidden_layer_size=3, verbose=0)
     originals = {name: parameter.clone() for name, parameter in model.named_parameters()}
     with pytest.raises(FloatingPointError, match="non-finite DisARM"):
         _disarm_step(model, torch.full((4, 1, 2), float("nan")), torch.zeros(4, 2),

@@ -11,45 +11,27 @@ from torch import nn
 
 from .data import VARXLaggedDataset, construct_varx_lagged_dataset
 from .models import GSEVARX
-from .regularizers import (
-    ExogenousGroupRegularizer, NGCRegularizer,
-    RegularizerName,
-)
 from .exogenous import ExogenousLayout
 from .training import (
-    GSEVARTrainingConfig,
-    _OPTIMIZATION_METRICS,
-    _alternating_proximal_step,
-    _iter_batches,
-    _make_endogenous_regularizer,
-    _make_gated_optimizer,
-    _resolve_device,
-    _validate_config,
-    _weight_decay_penalty,
-    temporal_smoothness_penalty,
+    GSEVARTrainingConfig, _iter_batches, _make_optimizer, _resolve_device,
+    _validate_config, _smoothness_losses, _adam_disarm_step,
 )
+
 
 
 @dataclass(frozen=True)
 class GSEVARXTrainingConfig(GSEVARTrainingConfig):
-    """Training configuration for generic endogenous/exogenous GSEVARX.
+    """DisARM training with separate endogenous and exogenous selection costs.
 
-    Existing regularization fields apply to the endogenous branch. Optional
-    ``*_exog`` values override them for the exogenous branch. Gate penalty
-    weights set to ``None`` reuse the corresponding endogenous value only
-    when supported by the selected exogenous regularizer; otherwise they
-    resolve to zero. Other ``None`` overrides always reuse the endogenous value.
+    ``None`` exogenous overrides inherit the corresponding endogenous value.
+    Each packed feature represents one physical source/lag selection route.
     """
-
     exog_order: int = 0
     include_current_exog: bool = True
-    lambda_ngc_exog: float | None = None
+    lambda_l0_exog: float | None = None
     lambda_smooth_exog: float | None = None
     lambda_jacobian_exog: float | None = None
-    sparse_group_lambda_exog: float | None = None
-    sparse_l1_lambda_exog: float | None = None
-    exogenous_gate_init: float | None = None
-    regularizer_exog: RegularizerName | None = None
+    exogenous_gate_probability_init: float | None = None
     early_stopping: bool = False
     early_stopping_patience: int = 100
     early_stopping_min_delta: float = 0.0
@@ -115,28 +97,6 @@ def _resolved(value: float | None, fallback: float) -> float:
     return fallback if value is None else value
 
 
-def _exogenous_regularizer_kwargs(config: GSEVARXTrainingConfig) -> dict:
-    """Resolve compatible inherited gate weights without mutating config."""
-    name = config.regularizer_exog or config.regularizer
-    uses_ngc = name in ("group_lasso", "hierarchical_group_lasso")
-    uses_sparse = name == "sparse_group_lasso"
-    return dict(
-        name=name,
-        lam=_resolved(
-            config.lambda_ngc_exog,
-            config.lambda_ngc if uses_ngc else 0.0,
-        ),
-        sparse_l1_lambda=_resolved(
-            config.sparse_l1_lambda_exog,
-            config.sparse_l1_lambda if uses_sparse else 0.0,
-        ),
-        sparse_group_lambda=_resolved(
-            config.sparse_group_lambda_exog,
-            config.sparse_group_lambda if uses_sparse else 0.0,
-        ),
-    )
-
-
 def _validate_optional_nonnegative(
     name: str,
     value: float | None,
@@ -166,34 +126,11 @@ def _validate_varx_config(config: GSEVARXTrainingConfig) -> None:
         raise ValueError(
             "include_current_exog must be True when exog_order is zero"
         )
-    for name in (
-        "lambda_ngc_exog",
-        "lambda_smooth_exog",
-        "lambda_jacobian_exog",
-        "sparse_group_lambda_exog",
-        "sparse_l1_lambda_exog",
-        "exogenous_gate_init",
-    ):
+    for name in ("lambda_l0_exog", "lambda_smooth_exog", "lambda_jacobian_exog"):
         _validate_optional_nonnegative(name, getattr(config, name))
-
-    exog_name = config.regularizer_exog or config.regularizer
-    if exog_name not in ("none", "group_lasso", "sparse_group_lasso", "hierarchical_group_lasso"):
-        raise ValueError("unsupported regularizer_exog")
-    exogenous_kwargs = _exogenous_regularizer_kwargs(config)
-    if exog_name == "sparse_group_lasso":
-        if exogenous_kwargs["lam"] != 0:
-            raise ValueError(
-                "sparse_group_lasso does not use lambda_ngc_exog. Use "
-                "sparse_group_lambda_exog and sparse_l1_lambda_exog instead."
-            )
-    elif (
-        exogenous_kwargs["sparse_group_lambda"] != 0
-        or exogenous_kwargs["sparse_l1_lambda"] != 0
-    ):
-        raise ValueError(
-            "sparse_group_lambda_exog and sparse_l1_lambda_exog are only "
-                "used with the exogenous sparse_group_lasso regularizer."
-        )
+    probability = config.exogenous_gate_probability_init
+    if probability is not None and (not math.isfinite(probability) or not 0 < probability < 1):
+        raise ValueError("exogenous_gate_probability_init must be strictly between 0 and 1")
 
 
 def _to_torch_varx_dataset(
@@ -226,15 +163,6 @@ def _to_torch_varx_dataset(
             dtype=torch.long,
             device=device,
         ),
-    )
-
-
-def _make_optimizer(
-    config: GSEVARXTrainingConfig,
-    model: GSEVARX,
-) -> torch.optim.Optimizer:
-    return _make_gated_optimizer(
-        config, model, gate_names=("endogenous_gate", "exogenous_gate"),
     )
 
 
@@ -311,131 +239,46 @@ def _validation_mse(
     return value
 
 
-def _make_regularizers(
-    config: GSEVARXTrainingConfig,
-    layout: ExogenousLayout | None = None,
-) -> tuple[
-    NGCRegularizer,
-    NGCRegularizer | ExogenousGroupRegularizer,
-]:
-    endogenous_regularizer = _make_endogenous_regularizer(config)
-    exogenous_kwargs = _exogenous_regularizer_kwargs(config)
-    exogenous_regularizer = (
-        NGCRegularizer(**exogenous_kwargs, reduction="sum", lag_dim=0)
-        if layout is None else ExogenousGroupRegularizer(
-            **exogenous_kwargs, layout=layout
-        )
-    )
-    return endogenous_regularizer, exogenous_regularizer
+def _masked_losses(model, y, x, targets, times, masks, config):
+    smooth_weights = (config.lambda_smooth, _resolved(config.lambda_smooth_exog, config.lambda_smooth))
+    jacobian_weights = (config.lambda_jacobian, _resolved(config.lambda_jacobian_exog, config.lambda_jacobian))
+    prediction, coefficients, mismatches = model.forward_with_masks(
+        y, x, masks["endogenous"], masks["exogenous"],
+        need_mismatch=any(jacobian_weights))
+    error = (prediction - targets).square()
+    mse = error.mean()
+    scores = error.detach().mean(dim=0) / model.num_endogenous
+    smooth, jacobian = mse.new_zeros(()), mse.new_zeros(())
+    for c, mismatch, sw, jw in zip(coefficients, mismatches, smooth_weights, jacobian_weights):
+        if sw:
+            scalar, target_scores = _smoothness_losses(c, times, config.smoothness_mode, config.smoothness_eps)
+            smooth = smooth + sw * scalar
+            scores = scores + sw * target_scores
+        if jw:
+            squared = mismatch.square()
+            jacobian = jacobian + jw * squared.mean()
+            scores = scores + jw * squared.detach().mean(dim=(0, 1, 3)) / model.num_endogenous
+    return dict(mse=mse, smooth=smooth, jacobian=jacobian), scores
 
 
-def _epoch(
-    model: GSEVARX,
-    dataset: _TorchVARXLaggedDataset,
-    config: GSEVARXTrainingConfig,
-    optimizer: torch.optim.Optimizer,
-    endogenous_regularizer: NGCRegularizer,
-    exogenous_regularizer: NGCRegularizer | ExogenousGroupRegularizer,
-    criterion: nn.Module,
-    device: torch.device,
-    rng: np.random.Generator,
-) -> dict[str, float]:
+def _epoch(model, dataset, config, optimizer, rng, generator):
     model.train()
-    metric_names = (
-        "loss",
-        "mse",
-        "ngc",
-        "ngc_endogenous",
-        "ngc_exogenous",
-        "smooth",
-        "smooth_endogenous",
-        "smooth_exogenous",
-        "jacobian",
-        "jacobian_endogenous",
-        "jacobian_exogenous",
-        *_OPTIMIZATION_METRICS,
-    )
-    totals = {
-        name: torch.zeros((), device=device)
-        for name in metric_names
-    }
-    n_batches = 0
-    exogenous_smoothness_weight = _resolved(
-        config.lambda_smooth_exog,
-        config.lambda_smooth,
-    )
-    exogenous_jacobian_weight = _resolved(
-        config.lambda_jacobian_exog,
-        config.lambda_jacobian,
-    )
-    use_jacobian = (
-        config.lambda_jacobian != 0 or exogenous_jacobian_weight != 0
-    )
-
-    for batch_idx in _iter_batches(
-        dataset.endogenous_predictors.shape[0],
-        config.batch_size,
-        shuffle=config.shuffle,
-        rng=rng,
-        device=device,
-    ):
-        endogenous_inputs = dataset.endogenous_predictors[batch_idx]
-        exogenous_inputs = dataset.exogenous_predictors[batch_idx]
-        targets = dataset.responses[batch_idx]
-        time_index = dataset.time_index[batch_idx]
-
-        def evaluate(create_graph: bool) -> dict[str, torch.Tensor]:
-            with torch.set_grad_enabled(create_graph):
-                predictions, endogenous_coeffs, exogenous_coeffs = model(
-                    endogenous_inputs, exogenous_inputs,
-                )
-                mse = criterion(predictions, targets)
-                smooth_endogenous = (config.lambda_smooth * temporal_smoothness_penalty(
-                    endogenous_coeffs, time_index,
-                    mode=config.smoothness_mode, eps=config.smoothness_eps,
-                ) if config.lambda_smooth else mse.new_zeros(()))
-                smooth_exogenous = (exogenous_smoothness_weight * temporal_smoothness_penalty(
-                    exogenous_coeffs, time_index,
-                    mode=config.smoothness_mode, eps=config.smoothness_eps,
-                ) if exogenous_smoothness_weight else mse.new_zeros(()))
-                smooth = smooth_endogenous + smooth_exogenous
-                if use_jacobian:
-                    endogenous_mismatch, exogenous_mismatch = (
-                        model.coefficient_jacobian_mismatches_for_regularization(
-                            endogenous_inputs, exogenous_inputs, create_graph=create_graph,
-                        )
-                    )
-                    jacobian_endogenous = config.lambda_jacobian * endogenous_mismatch.pow(2).mean()
-                    jacobian_exogenous = exogenous_jacobian_weight * exogenous_mismatch.pow(2).mean()
-                else:
-                    jacobian_endogenous = mse.new_zeros(())
-                    jacobian_exogenous = mse.new_zeros(())
-                jacobian = jacobian_endogenous + jacobian_exogenous
-                ngc_endogenous = endogenous_regularizer.penalty(model.endogenous_gate)
-                ngc_exogenous = exogenous_regularizer.penalty(model.exogenous_gate)
-                ngc = ngc_endogenous + ngc_exogenous
-                decay = _weight_decay_penalty(optimizer, mse)
-                return dict(
-                    loss=mse + smooth + jacobian + ngc + decay, mse=mse,
-                    ngc=ngc, ngc_endogenous=ngc_endogenous, ngc_exogenous=ngc_exogenous,
-                    smooth=smooth, smooth_endogenous=smooth_endogenous,
-                    smooth_exogenous=smooth_exogenous,
-                    jacobian=jacobian, jacobian_endogenous=jacobian_endogenous,
-                    jacobian_exogenous=jacobian_exogenous, weight_decay=decay,
-                )
-
-        batch_metrics = _alternating_proximal_step(optimizer, evaluate, (
-            (model.endogenous_gate, endogenous_regularizer),
-            (model.exogenous_gate, exogenous_regularizer),
-        ))
-        for name in totals:
-            totals[name] += batch_metrics.get(name, totals[name].new_zeros(())).detach()
-        n_batches += 1
-
-    return {
-        name: float((value / max(n_batches, 1)).detach().cpu())
-        for name, value in totals.items()
-    }
+    totals = {}
+    samples = 0
+    for indices in _iter_batches(len(dataset.responses), config.batch_size,
+                                  config.shuffle, rng, dataset.responses.device):
+        y, x = dataset.endogenous_predictors[indices], dataset.exogenous_predictors[indices]
+        targets, times = dataset.responses[indices], dataset.time_index[indices]
+        evaluate = lambda masks: _masked_losses(model, y, x, targets, times, masks, config)
+        metrics = _adam_disarm_step(model, evaluate,
+            {"endogenous": config.lambda_l0,
+             "exogenous": _resolved(config.lambda_l0_exog, config.lambda_l0)},
+            config, optimizer, generator)
+        model.update_causal_gates_()
+        for name, value in metrics.items():
+            totals[name] = totals.get(name, value.new_zeros(())) + value.detach() * len(targets)
+        samples += len(targets)
+    return {name: float((value / samples).cpu()) for name, value in totals.items()}
 
 
 @torch.no_grad()
@@ -473,12 +316,10 @@ def _log_epoch(
         f"Epoch {epoch:>4}/{config.max_epochs:<4} | "
         f"loss={metrics['loss']:.6g} | "
         f"mse={metrics['mse']:.6g} | "
-        f"ngc={metrics['ngc']:.6g} | "
+        f"l0={metrics['l0']:.6g} | "
         f"smooth={metrics['smooth']:.6g} | "
         f"jacobian={metrics['jacobian']:.6g} | "
         f"l2={metrics['weight_decay']:.6g} | "
-        f"gate_step={metrics['gate_step_size']:.3g} | "
-        f"gate_residual={metrics['gate_proximal_gradient_norm']:.3g} | "
         f"{validation_log}"
         f"endog_edges={endogenous_active}/{endogenous_total} | "
         f"exog_edges={exogenous_active}/{exogenous_total}"
@@ -553,14 +394,14 @@ def fit_gse_varx(
     known_future_exog=(),
     endog_names=None,
     validation_data: VARXLaggedDataset | tuple | None = None,
+    epoch_callback: Callable | None = None,
 ) -> GSEVARXFitResult:
     """Fit GSEVARX without assuming application-specific variable names.
 
     Optional exog_features identifies already-expanded columns. Alternatively,
     exog_names/exog_lags describe raw variables and allowed physical lags;
     negative lags require known_future_exog. Layout-aware mode preserves one
-    joint packed exogenous coefficient generator, groups gates by original
-    source for each target, and returns source-level graphs/strengths while
+    joint packed exogenous coefficient generator, selects each packed source/lag route independently, and returns source-level graphs/strengths while
     keeping the coefficient tensor packed. Legacy uniform-lag mode is unchanged.
 
     Optional validation_data is a preconstructed VARXLaggedDataset or a tuple
@@ -606,8 +447,8 @@ def fit_gse_varx(
             include_current_exog=config.include_current_exog,
             hidden_layer_size=config.hidden_layer_size,
             num_hidden_layers=config.num_hidden_layers,
-            gate_init=config.gate_init,
-            exogenous_gate_init=config.exogenous_gate_init,
+            gate_probability_init=config.gate_probability_init,
+            exogenous_gate_probability_init=config.exogenous_gate_probability_init,
             exogenous_layout=dataset_np.exogenous_layout,
         )
     if model.num_endogenous != num_endogenous:
@@ -635,25 +476,13 @@ def fit_gse_varx(
         )
 
     model.to(device)
-    model.project_causal_gates_()
-    endogenous_regularizer, exogenous_regularizer = _make_regularizers(config, dataset_np.exogenous_layout)
+    model.update_causal_gates_()
     optimizer = _make_optimizer(config, model)
-    criterion = nn.MSELoss(reduction="mean")
+    generator = torch.Generator(device=device)
+    generator.seed() if config.seed is None else generator.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
-    metric_names = (
-        "loss",
-        "mse",
-        "ngc",
-        "ngc_endogenous",
-        "ngc_exogenous",
-        "smooth",
-        "smooth_endogenous",
-        "smooth_exogenous",
-        "jacobian",
-        "jacobian_endogenous",
-        "jacobian_exogenous",
-        *_OPTIMIZATION_METRICS,
-    )
+    metric_names = ("loss", "mse", "smooth", "jacobian", "weight_decay", "l0",
+                    "l0_endogenous", "l0_exogenous", "expected_lag_edges", "gate_gradient_norm")
     history = {name: [] for name in metric_names}
     if validation is not None:
         history["val_mse"] = []
@@ -664,17 +493,7 @@ def fit_gse_varx(
     stopped_epoch = None
 
     for epoch in range(1, config.max_epochs + 1):
-        metrics = _epoch(
-            model,
-            dataset,
-            config,
-            optimizer,
-            endogenous_regularizer,
-            exogenous_regularizer,
-            criterion,
-            device,
-            rng,
-        )
+        metrics = _epoch(model, dataset, config, optimizer, rng, generator)
         for name, value in metrics.items():
             history[name].append(value)
         if validation is not None:
@@ -691,6 +510,8 @@ def fit_gse_varx(
             else:
                 bad_epochs += 1
         _log_epoch(epoch, config, metrics, model)
+        if epoch_callback is not None:
+            epoch_callback(epoch, model, metrics)
         if config.early_stopping and bad_epochs >= config.early_stopping_patience:
             stopped_epoch = epoch
             if config.verbose > 0:

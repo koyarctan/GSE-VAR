@@ -10,15 +10,8 @@ from gse_var import (
     construct_varx_lagged_dataset, fit_gse_varx,
 )
 import gse_var.varx as varx
-from gse_var.training import _OPTIMIZATION_METRICS
-
-
-METRICS = (
-    "loss", "mse", "ngc", "ngc_endogenous", "ngc_exogenous", "smooth",
-    "smooth_endogenous", "smooth_exogenous", "jacobian", "jacobian_endogenous",
-    "jacobian_exogenous",
-    *_OPTIMIZATION_METRICS,
-)
+METRICS = ("loss", "mse", "smooth", "jacobian", "weight_decay", "l0",
+           "l0_endogenous", "l0_exogenous", "expected_lag_edges", "gate_gradient_norm")
 
 
 def setup(packed=True, **overrides):
@@ -32,9 +25,7 @@ def setup(packed=True, **overrides):
     kwargs = {"exog_features": layout} if packed else {}
     config = GSEVARXTrainingConfig(
         order=2, hidden_layer_size=3, max_epochs=8, batch_size=4,
-        regularizer="hierarchical_group_lasso", lambda_ngc=0.01,
-        regularizer_exog="sparse_group_lasso",
-        sparse_group_lambda_exog=0.02, sparse_l1_lambda_exog=0.01,
+        lambda_l0=0.01, lambda_l0_exog=0.02,
         early_stopping=True, early_stopping_patience=2, verbose=0, device="cpu",
     )
     validation = construct_varx_lagged_dataset(*valid, order=2, **kwargs)

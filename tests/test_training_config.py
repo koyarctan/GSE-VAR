@@ -1,69 +1,15 @@
+from dataclasses import fields,replace
 import numpy as np
 import pytest
+from gse_var import GSEVARTrainingConfig,GSEVARXTrainingConfig,fit_gse_varx
 
-pytest.importorskip("torch")
+@pytest.mark.parametrize('cls',[GSEVARTrainingConfig,GSEVARXTrainingConfig])
+def test_configuration_contains_only_binary_structure_learning(cls):
+    names={f.name for f in fields(cls)}
+    assert {'lambda_l0','gate_probability_init'}<=names
+    assert not {'regularizer','sparse_l1_lambda','sparse_group_lambda','lambda_ngc','gate_init'}&names
 
-from gse_var import GSEVARTrainingConfig, fit_gse_var
-
-
-def test_sparse_group_lasso_config_rejects_lambda_ngc():
-    data = np.random.default_rng(0).normal(size=(12, 2)).astype("float32")
-    config = GSEVARTrainingConfig(
-        order=2,
-        hidden_layer_size=4,
-        max_epochs=1,
-        lambda_ngc=1e-3,
-        regularizer="sparse_group_lasso",
-        verbose=0,
-    )
-
-    with pytest.raises(ValueError, match="sparse_group_lasso does not use lambda_ngc"):
-        fit_gse_var(data, config)
-
-
-def test_hierarchical_group_lasso_config_uses_lambda_ngc():
-    data = np.random.default_rng(0).normal(size=(12, 2)).astype("float32")
-    config = GSEVARTrainingConfig(
-        order=2,
-        hidden_layer_size=4,
-        max_epochs=1,
-        lambda_ngc=1e-3,
-        regularizer="hierarchical_group_lasso",
-        verbose=0,
-    )
-
-    result = fit_gse_var(data, config)
-
-    assert len(result.history["loss"]) == 1
-
-
-def test_optional_jacobian_regularization_is_logged():
-    data = np.random.default_rng(2).normal(size=(16, 2)).astype("float32")
-    config = GSEVARTrainingConfig(
-        order=2,
-        hidden_layer_size=4,
-        max_epochs=1,
-        batch_size=7,
-        lambda_jacobian=0.1,
-        verbose=0,
-    )
-
-    result = fit_gse_var(data, config)
-
-    assert len(result.history["jacobian"]) == 1
-    assert result.history["jacobian"][0] >= 0.0
-    assert np.isfinite(result.history["jacobian"][0])
-
-
-def test_negative_jacobian_regularization_is_rejected():
-    data = np.random.default_rng(3).normal(size=(12, 2)).astype("float32")
-    config = GSEVARTrainingConfig(
-        order=2,
-        hidden_layer_size=4,
-        max_epochs=1,
-        lambda_jacobian=-0.1,
-        verbose=0,
-    )
-
-    with pytest.raises(ValueError, match="lambda_jacobian"):
-        fit_gse_var(data, config)
+@pytest.mark.parametrize('field,value',[('lambda_l0_exog',-1),('lambda_l0_exog',float('nan')),('exogenous_gate_probability_init',0),('exogenous_gate_probability_init',1)])
+def test_invalid_exogenous_settings_are_rejected(field,value):
+    cfg=replace(GSEVARXTrainingConfig(1,2,max_epochs=1,verbose=0),**{field:value})
+    with pytest.raises(ValueError):fit_gse_varx(np.zeros((5,1)),np.zeros((5,1)),cfg)

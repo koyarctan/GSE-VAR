@@ -1,0 +1,18 @@
+\begin{tikzpicture}[box/.style={draw=violet!80!black,fill=violet!5,rounded corners=2pt,minimum width=3.1cm,minimum height=.65cm,font=\small},route/.style={-{Stealth[length=2.5mm]},line width=.9pt,draw=violet!80!black},every edge quotes/.style={font=\footnotesize}]
+\node[box] (dairy) at (-4,2.2) {乳製品};
+\node[box] (bread) at (0.3,3.2) {パン・ベーカリー};
+\node[box] (deli) at (0.3,1.9) {デリ食品};
+\node[box] (meat) at (0.3,0.6) {肉類};
+\node[box] (seafood) at (5,0.6) {魚介};
+\node[box] (frozen) at (-4,-1) {冷凍食品};
+\node[box] (liquor) at (0.3,-1) {酒類};
+\node[box] (beverages) at (-4,-2.5) {飲料};
+\node[box] (prepared) at (5,-2.5) {調理済食品};
+\draw[route] (beverages.east) -- node[above,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.361\)（7日前）} (prepared.west);
+\draw[route] (dairy.east) -- node[above,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.306\)} (bread.west);
+\draw[route] (dairy.east) -- node[below,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.437\)} (deli.west);
+\draw[route] (frozen.east) -- node[above,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.146\)} (liquor.west);
+\draw[route] (dairy.south east) -- node[below,sloped,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.369\)} (meat.north west);
+\draw[route,dashed,draw=gray] (liquor.east) -- node[below,sloped,font=\footnotesize,fill=white,inner sep=1pt,text=gray] {\(+0.035\)} (seafood.south west);
+\draw[route] (meat.east) -- node[above,font=\footnotesize,fill=white,inner sep=1pt,text=violet!80!black] {\(+0.233\)} (seafood.west);
+\end{tikzpicture}

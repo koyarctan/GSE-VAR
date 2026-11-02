@@ -1,0 +1,68 @@
+{
+  "start": "2016-07-01",
+  "train_end": "2017-02-28",
+  "validation_end": "2017-04-30",
+  "end": "2017-08-15",
+  "min_nonzero_fraction": 0.8,
+  "order": 7,
+  "hidden": 8,
+  "layers": 1,
+  "epochs": 5000,
+  "check_every": 100,
+  "early_check_until": 200,
+  "early_check_every": 20,
+  "validation_blocks": 4,
+  "learning_rates": [
+    {
+      "lr": 0.003,
+      "gate_lr": 0.03
+    },
+    {
+      "lr": 0.001,
+      "gate_lr": 0.01
+    },
+    {
+      "lr": 0.001,
+      "gate_lr": 0.03
+    }
+  ],
+  "smooth": 0.01,
+  "decay": 0.001,
+  "linear_l1": 0.0001,
+  "probability_init": 0.5,
+  "tuning_seed": 42,
+  "seeds": [
+    42
+  ],
+  "disarm_budgets": [
+    0,
+    0.3,
+    1,
+    2,
+    3,
+    4,
+    6,
+    10,
+    20,
+    40
+  ],
+  "linear_groups": [
+    0,
+    1e-05,
+    3e-05,
+    0.0001,
+    0.0003,
+    0.001,
+    0.003,
+    0.01,
+    0.03,
+    0.1
+  ],
+  "sign_fraction": 0.8,
+  "devices": {
+    "Linear-SGL": "cpu",
+    "GSE-VAR": "cpu"
+  },
+  "mode": "full",
+  "device": "cuda:0"
+}

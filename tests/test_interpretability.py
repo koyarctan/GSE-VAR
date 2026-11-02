@@ -37,15 +37,3 @@ def test_evaluate_jacobian_agreement_shapes_metrics_and_mode():
     assert result.active_mae >= 0.0
     assert 0.0 <= result.active_sign_agreement <= 1.0
     assert -1.0 <= result.cosine_similarity <= 1.0
-
-
-def test_evaluate_jacobian_agreement_rejects_ungated_model():
-    model = GSEVAR(
-        num_vars=2,
-        order=1,
-        hidden_layer_size=3,
-        use_causal_gate=False,
-    )
-
-    with pytest.raises(ValueError, match="use_causal_gate=True"):
-        evaluate_jacobian_agreement(model, np.zeros((2, 1, 2), dtype="float32"))

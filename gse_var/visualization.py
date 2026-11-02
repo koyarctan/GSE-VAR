@@ -175,7 +175,7 @@ def plot_causal_gate_by_lag(
     ----------
     result_or_model:
         A ``GSEVARFitResult`` returned by ``fit_gse_var`` or a ``GSEVAR``
-        instance with ``use_causal_gate=True``.
+        instance with binary structural gates.
     include_summary:
         If true, append a final panel summarizing gate strength over lags.
     summary:

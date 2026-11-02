@@ -22,7 +22,8 @@ def test_vectorized_gse_var_forward_shapes_and_gradients():
 
     assert preds.shape == (4, 3)
     assert coeffs.shape == (4, 2, 3, 3)
-    assert model.causal_gate.grad is not None
+    assert model.causal_gate.grad is None
+    assert model.gate_logits.grad is None
 
 
 def test_fast_jacobian_matches_explicit_autograd():

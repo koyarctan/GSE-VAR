@@ -121,10 +121,8 @@ def test_varx_jacobian_regularizer_does_not_update_either_gate():
     predictions, _, _ = model(endogenous, exogenous)
     predictions.pow(2).mean().backward()
 
-    assert model.endogenous_gate.grad is not None
-    assert model.exogenous_gate.grad is not None
-    assert torch.count_nonzero(model.endogenous_gate.grad) > 0
-    assert torch.count_nonzero(model.exogenous_gate.grad) > 0
+    assert model.endogenous_gate_logits.grad is None
+    assert model.exogenous_gate_logits.grad is None
 
 
 def test_fit_gse_varx_smoke_and_diagnostics():
@@ -139,9 +137,8 @@ def test_fit_gse_varx_smoke_and_diagnostics():
         max_epochs=2,
         batch_size=8,
         learning_rate=1e-2,
-        regularizer="group_lasso",
-        lambda_ngc=1e-3,
-        lambda_ngc_exog=2e-3,
+        lambda_l0=1e-3,
+        lambda_l0_exog=2e-3,
         lambda_jacobian=0.1,
         lambda_jacobian_exog=0.2,
         verbose=0,

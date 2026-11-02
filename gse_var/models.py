@@ -10,6 +10,10 @@ from .exogenous import ExogenousLayout
 
 AggregationName = Literal["max", "mean", "median"]
 
+def _logit(probability: float) -> float:
+    return math.log(probability) - math.log1p(-probability)
+
+
 # GVARの実装に必要なモジュール
 class LagwiseMLP(nn.Module):
     """Independent MLP per lag, evaluated as batched tensor operations.
@@ -198,7 +202,7 @@ class GSEVAR(nn.Module):
     The model produces an effective generalized-coefficient tensor with shape
     ``[batch, lag, target, source]``.  For target ``i`` and lag ``k``, the
     coefficient generator receives only
-    ``causal_gate[k, i, :] * inputs[:, k, :]``.  The same non-negative gate is
+    ``causal_gate[k, i, :] * inputs[:, k, :]``.  The same binary gate is
     then applied to the generated coefficients.
 
     Consequently, if ``causal_gate[k, i, j] == 0``, source ``j`` has neither a
@@ -207,7 +211,7 @@ class GSEVAR(nn.Module):
 
     Gated models always have a separate, input-independent prediction intercept.
     It is not part of the coefficient tensor or the causal graph.
-    With the default unit gates, initial predictions copy the most recent
+    With initially open gates, initial predictions copy the most recent
     observation: only that lag's coefficient diagonal starts at one.
     """
 
@@ -217,8 +221,7 @@ class GSEVAR(nn.Module):
         order: int,
         hidden_layer_size: int,
         num_hidden_layers: int = 1,
-        use_causal_gate: bool = True,
-        gate_init: float = 1.0,
+        gate_probability_init: float = 0.9,
     ) -> None:
         super().__init__()
         if num_vars <= 0:
@@ -227,74 +230,42 @@ class GSEVAR(nn.Module):
             raise ValueError("order must be positive")
         if hidden_layer_size <= 0:
             raise ValueError("hidden_layer_size must be positive")
-        if use_causal_gate and (
-            not math.isfinite(gate_init) or gate_init < 0
-        ):
-            raise ValueError("gate_init must be non-negative")
-
+        if not math.isfinite(gate_probability_init) or not 0 < gate_probability_init < 1:
+            raise ValueError("gate_probability_init must be strictly between 0 and 1")
         self.num_vars = num_vars
         self.order = order
         self.hidden_layer_size = hidden_layer_size
         self.num_hidden_layers = num_hidden_layers
-        self.use_causal_gate = use_causal_gate
+        self.coeff_net = TargetLagwiseMLP(order, num_vars, num_vars, hidden_layer_size,
+                                        num_vars, num_hidden_layers)
+        nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
+        shape = (order, num_vars, num_vars)
+        self.gate_logits = nn.Parameter(torch.full(shape, _logit(gate_probability_init)))
+        self.register_buffer("causal_gate", torch.ones(shape))
+        self.intercept = nn.Parameter(torch.zeros(num_vars))
+        self.update_causal_gate_()
 
-        if use_causal_gate:
-            # Target-specific coefficient generators are required because each
-            # target has a different structural input mask.
-            self.coeff_net = TargetLagwiseMLP(
-                num_lags=order,
-                num_targets=num_vars,
-                input_dim=num_vars,
-                hidden_dim=hidden_layer_size,
-                output_dim=num_vars,
-                num_hidden_layers=num_hidden_layers,
-            )
-            nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
-        else:
-            # Preserve the original ungated GVAR baseline architecture and its
-            # checkpoint/parameter shapes.
-            self.coeff_net = LagwiseMLP(
-                num_lags=order,
-                input_dim=num_vars,
-                hidden_dim=hidden_layer_size,
-                output_dim=num_vars * num_vars,
-                num_hidden_layers=num_hidden_layers,
-            )
+    @property
+    def gate_probabilities(self):
+        return self.gate_logits.sigmoid()
 
-        if use_causal_gate:
-            gate = torch.full(
-                (order, num_vars, num_vars),
-                float(gate_init),
-            )
-            self.causal_gate = nn.Parameter(gate)
-        else:
-            self.register_parameter("causal_gate", None)
+    @property
+    def gate_logits_by_branch(self):
+        return {"endogenous": self.gate_logits}
 
-        self.register_parameter(
-            "intercept", nn.Parameter(torch.zeros(num_vars)) if use_causal_gate else None
-        )
+    @torch.no_grad()
+    def update_causal_gate_(self):
+        self.causal_gate.copy_((self.gate_logits >= 0).to(self.causal_gate.dtype))
+        return self.causal_gate
 
     def reset_parameters(self) -> None:
         self.coeff_net.reset_parameters()
-        if self.causal_gate is not None:
-            nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
-        if self.intercept is not None:
-            with torch.no_grad():
-                self.intercept.zero_()
+        nn.init.ones_(self.coeff_net.biases[-1][-1].diagonal())
+        with torch.no_grad():
+            self.intercept.zero_()
 
     def _add_intercept(self, predictions: torch.Tensor) -> torch.Tensor:
-        # Only the separate, ungated GVAR baseline has no intercept.
-        return predictions if self.intercept is None else predictions + self.intercept
-
-    @torch.no_grad()
-    def project_causal_gate_(self) -> torch.Tensor:
-        """Project the structural gate onto the non-negative orthant."""
-        if self.causal_gate is None:
-            raise RuntimeError(
-                "project_causal_gate_ requires use_causal_gate=True"
-            )
-        self.causal_gate.clamp_(min=0.0)
-        return self.causal_gate
+        return predictions + self.intercept
 
     def forward(
         self,
@@ -303,6 +274,32 @@ class GSEVAR(nn.Module):
         _, coeffs, _, _ = self._coefficient_components(inputs)
         preds = torch.einsum("bkij,bkj->bi", coeffs, inputs)
         return self._add_intercept(preds), coeffs
+
+    def _masked_forward(self, inputs, mask, *, need_mismatch=False):
+        if inputs.ndim != 3 or inputs.shape[1:] != (self.order, self.num_vars):
+            raise ValueError("inputs must have shape [batch, order, num_vars]")
+        if mask.shape != self.causal_gate.shape:
+            raise ValueError("mask must have shape [order, target, source]")
+        gate = mask.detach().to(device=inputs.device, dtype=inputs.dtype)
+        coefficient_inputs = inputs.unsqueeze(2) * gate.unsqueeze(0)
+        if need_mismatch and not coefficient_inputs.requires_grad:
+            coefficient_inputs.requires_grad_(True)
+        raw = self.coeff_net(coefficient_inputs)
+        coefficients = raw * gate.unsqueeze(0)
+        mismatch = None
+        if need_mismatch:
+            _, _, mismatch = _prediction_jacobian_components(
+                raw, coefficients, coefficient_inputs, gate, create_graph=True,
+            )
+        prediction = self._add_intercept(torch.einsum("bkij,bkj->bi", coefficients, inputs))
+        return prediction, coefficients, mismatch
+
+    def forward_with_mask(self, inputs: torch.Tensor, mask: torch.Tensor):
+        """Evaluate one explicit binary mask without changing the inference mask."""
+        if not torch.all((mask == 0) | (mask == 1)):
+            raise ValueError("mask must contain only 0 and 1")
+        prediction, coefficients, _ = self._masked_forward(inputs, mask)
+        return prediction, coefficients
 
     def _coefficient_components(
         self,
@@ -324,32 +321,12 @@ class GSEVAR(nn.Module):
                 f"{self.num_vars}], got {tuple(inputs.shape)}"
             )
 
-        if self.causal_gate is None:
-            raw_coeffs = self.coeff_net(inputs).reshape(
-                inputs.shape[0],
-                self.order,
-                self.num_vars,
-                self.num_vars,
-            )
-            coeffs = raw_coeffs
-            coefficient_inputs = None
-            causal_gate = None
-        else:
-            causal_gate = (
-                self.causal_gate.detach()
-                if detach_causal_gate
-                else self.causal_gate
-            )
-            gate = causal_gate.unsqueeze(0)
-            target_inputs = inputs.unsqueeze(2)
-            coefficient_inputs = target_inputs * gate
-            if (
-                require_coefficient_input_grad
-                and not coefficient_inputs.requires_grad
-            ):
-                coefficient_inputs.requires_grad_(True)
-            raw_coeffs = self.coeff_net(coefficient_inputs)
-            coeffs = raw_coeffs * gate
+        causal_gate = self.causal_gate.detach() if detach_causal_gate else self.causal_gate
+        coefficient_inputs = inputs.unsqueeze(2) * causal_gate.unsqueeze(0)
+        if require_coefficient_input_grad and not coefficient_inputs.requires_grad:
+            coefficient_inputs.requires_grad_(True)
+        raw_coeffs = self.coeff_net(coefficient_inputs)
+        coeffs = raw_coeffs * causal_gate.unsqueeze(0)
         return raw_coeffs, coeffs, coefficient_inputs, causal_gate
 
     def _jacobian_components(
@@ -359,11 +336,6 @@ class GSEVAR(nn.Module):
         create_graph: bool,
         detach_causal_gate: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.causal_gate is None:
-            raise RuntimeError(
-                "Jacobian calculation requires use_causal_gate=True"
-            )
-
         with torch.enable_grad():
             raw_coeffs, coeffs, coefficient_inputs, causal_gate = (
                 self._coefficient_components(
@@ -433,19 +405,8 @@ class GSEVAR(nn.Module):
         return mismatch
 
     @torch.no_grad()
-    def gate_group_norms(self) -> torch.Tensor:
-        """Return ``[target, source]`` norms across lag gates."""
-        if self.causal_gate is None:
-            raise RuntimeError(
-                "gate_group_norms requires use_causal_gate=True"
-            )
-        return torch.linalg.vector_norm(self.causal_gate, ord=2, dim=0)
-
-    @torch.no_grad()
     def causal_graph_from_gate(self) -> torch.Tensor:
         """An edge is absent exactly when all its lag routes are zero."""
-        if self.causal_gate is None:
-            raise RuntimeError("causal_graph_from_gate requires use_causal_gate=True")
         return self.causal_gate.ne(0).any(dim=0).to(torch.int64)
 
     @staticmethod
@@ -469,7 +430,7 @@ class GSEVARX(nn.Module):
 
     Endogenous observations are predicted but exogenous observations are not.
     The two additive branches use separate coefficient generators and
-    non-negative structural gates:
+    Bernoulli structural gates:
 
     ``prediction = intercept + endogenous_coefficients * endogenous_lags``
     ``           + exogenous_coefficients * exogenous_terms``.
@@ -490,8 +451,8 @@ class GSEVARX(nn.Module):
         include_current_exog: bool,
         hidden_layer_size: int,
         num_hidden_layers: int = 1,
-        gate_init: float = 1.0,
-        exogenous_gate_init: float | None = None,
+        gate_probability_init: float = 0.9,
+        exogenous_gate_probability_init: float | None = None,
         exogenous_layout: ExogenousLayout | None = None,
     ) -> None:
         super().__init__()
@@ -509,15 +470,11 @@ class GSEVARX(nn.Module):
             )
         if hidden_layer_size <= 0:
             raise ValueError("hidden_layer_size must be positive")
-        if not math.isfinite(gate_init) or gate_init < 0:
-            raise ValueError("gate_init must be non-negative")
-        if exogenous_gate_init is None:
-            exogenous_gate_init = gate_init
-        if (
-            not math.isfinite(exogenous_gate_init)
-            or exogenous_gate_init < 0
-        ):
-            raise ValueError("exogenous_gate_init must be non-negative")
+        if exogenous_gate_probability_init is None:
+            exogenous_gate_probability_init = gate_probability_init
+        for value in (gate_probability_init, exogenous_gate_probability_init):
+            if not math.isfinite(value) or not 0 < value < 1:
+                raise ValueError("gate probabilities must be strictly between 0 and 1")
 
         self.num_endogenous = num_endogenous
         self.num_exogenous = num_exogenous
@@ -550,23 +507,57 @@ class GSEVARX(nn.Module):
             num_hidden_layers=num_hidden_layers,
         )
         nn.init.ones_(self.endogenous_coeff_net.biases[-1][-1].diagonal())
-        self.endogenous_gate = nn.Parameter(
-            torch.full(
-                (order, num_endogenous, num_endogenous),
-                float(gate_init),
-            )
-        )
-        self.exogenous_gate = nn.Parameter(
-            torch.full(
-                (
-                    self.num_exogenous_terms,
-                    num_endogenous,
-                    num_exogenous,
-                ),
-                float(exogenous_gate_init),
-            )
-        )
+        y_shape = (order, num_endogenous, num_endogenous)
+        x_shape = (self.num_exogenous_terms, num_endogenous, num_exogenous)
+        self.endogenous_gate_logits = nn.Parameter(torch.full(y_shape, _logit(gate_probability_init)))
+        self.exogenous_gate_logits = nn.Parameter(torch.full(x_shape, _logit(exogenous_gate_probability_init)))
+        self.register_buffer("endogenous_gate", torch.ones(y_shape))
+        self.register_buffer("exogenous_gate", torch.ones(x_shape))
         self.intercept = nn.Parameter(torch.zeros(num_endogenous))
+        self.update_causal_gates_()
+
+    @property
+    def endogenous_gate_probabilities(self):
+        return self.endogenous_gate_logits.sigmoid()
+
+    @property
+    def exogenous_gate_probabilities(self):
+        return self.exogenous_gate_logits.sigmoid()
+
+    @property
+    def gate_logits_by_branch(self):
+        return {"endogenous": self.endogenous_gate_logits,
+                "exogenous": self.exogenous_gate_logits}
+
+    @torch.no_grad()
+    def update_causal_gates_(self):
+        self.endogenous_gate.copy_((self.endogenous_gate_logits >= 0).to(self.endogenous_gate.dtype))
+        self.exogenous_gate.copy_((self.exogenous_gate_logits >= 0).to(self.exogenous_gate.dtype))
+
+    def forward_with_masks(self, endogenous_inputs, exogenous_inputs, endogenous_mask,
+                           exogenous_mask, *, need_mismatch=False):
+        """Evaluate fixed binary masks; leave the inference buffers unchanged."""
+        self._validate_inputs(endogenous_inputs, exogenous_inputs)
+        coefficients, mismatches = [], []
+        for inputs, net, mask, expected in (
+            (endogenous_inputs, self.endogenous_coeff_net, endogenous_mask, self.endogenous_gate),
+            (exogenous_inputs, self.exogenous_coeff_net, exogenous_mask, self.exogenous_gate),
+        ):
+            if mask.shape != expected.shape or not torch.all((mask == 0) | (mask == 1)):
+                raise ValueError("masks must be binary and match the branch gate shape")
+            mask = mask.detach().to(inputs)
+            if need_mismatch:
+                c, _, mismatch = self._branch_jacobian_components(
+                    inputs, net, mask, create_graph=True, detach_gate=True)
+            else:
+                _, c, _, _ = self._branch_coefficients(
+                    inputs, net, mask, require_input_grad=False, detach_gate=True)
+                mismatch = None
+            coefficients.append(c)
+            mismatches.append(mismatch)
+        prediction = self.intercept + sum(torch.einsum("bkij,bkj->bi", c, x)
+                                         for c, x in zip(coefficients, (endogenous_inputs, exogenous_inputs)))
+        return prediction, coefficients, mismatches
 
     def reset_parameters(self) -> None:
         self.endogenous_coeff_net.reset_parameters()
@@ -770,11 +761,6 @@ class GSEVARX(nn.Module):
             detach_gate=True,
         )
         return endogenous_mismatch, exogenous_mismatch
-
-    @torch.no_grad()
-    def project_causal_gates_(self) -> None:
-        self.endogenous_gate.clamp_(min=0.0)
-        self.exogenous_gate.clamp_(min=0.0)
 
     @torch.no_grad()
     def endogenous_graph_from_gate(

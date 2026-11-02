@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from .data import construct_lagged_dataset
-from .models import AggregationName, GSEVAR
+from .models import AggregationName, LagwiseMLP, GSEVAR
 from .training import (
     SmoothnessMode,
     _iter_batches,
@@ -16,6 +16,23 @@ from .training import (
     _to_torch_dataset,
     temporal_smoothness_penalty,
 )
+
+
+class GVARModel(nn.Module):
+    """Ungated GVAR baseline with independent lagwise coefficient generators."""
+    def __init__(self, num_vars, order, hidden_layer_size, num_hidden_layers=1):
+        super().__init__()
+        self.num_vars, self.order = num_vars, order
+        self.coeff_net = LagwiseMLP(order, num_vars, hidden_layer_size,
+                                   num_vars * num_vars, num_hidden_layers)
+        self.register_parameter("causal_gate", None)
+        self.register_parameter("intercept", None)
+
+    def forward(self, inputs):
+        coefficients = self.coeff_net(inputs).reshape(-1, self.order, self.num_vars, self.num_vars)
+        return torch.einsum("bkij,bkj->bi", coefficients, inputs), coefficients
+
+    coefficient_strength = staticmethod(GSEVAR.coefficient_strength)
 
 
 @dataclass(frozen=True)
@@ -43,7 +60,7 @@ class GVARBaselineTrainingConfig:
 
 @dataclass
 class GVARBaselineFitResult:
-    model: GSEVAR
+    model: GVARModel
     history: dict[str, list[float]] = field(default_factory=dict)
     coeffs: np.ndarray | None = None
     causal_strength: np.ndarray | None = None
@@ -63,7 +80,7 @@ def _validate_config(config: GVARBaselineTrainingConfig) -> None:
 
 def _make_optimizer(
     config: GVARBaselineTrainingConfig,
-    model: GSEVAR,
+    model: GVARModel,
 ) -> torch.optim.Optimizer:
     return torch.optim.Adam(
         model.parameters(),
@@ -86,7 +103,7 @@ def _coefficient_penalty(
 
 
 def _epoch(
-    model: GSEVAR,
+    model: GVARModel,
     dataset,
     config: GVARBaselineTrainingConfig,
     optimizer: torch.optim.Optimizer,
@@ -152,7 +169,7 @@ def _epoch(
 
 @torch.no_grad()
 def _active_edges_from_coeffs(
-    model: GSEVAR,
+    model: GVARModel,
     coeffs: torch.Tensor,
     config: GVARBaselineTrainingConfig,
 ) -> tuple[int, int]:
@@ -163,7 +180,7 @@ def _active_edges_from_coeffs(
 
 @torch.no_grad()
 def _infer(
-    model: GSEVAR,
+    model: GVARModel,
     dataset,
     config: GVARBaselineTrainingConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -184,7 +201,7 @@ def _log_epoch(
     epoch: int,
     config: GVARBaselineTrainingConfig,
     metrics: dict[str, float],
-    model: GSEVAR,
+    model: GVARModel,
     dataset,
     log_fn: Callable[[str], None] = print,
 ) -> None:
@@ -213,7 +230,7 @@ def _log_epoch(
 def fit_gvar(
     data: np.ndarray | list[np.ndarray],
     config: GVARBaselineTrainingConfig,
-    model: GSEVAR | None = None,
+    model: GVARModel | None = None,
 ) -> GVARBaselineFitResult:
     """Fit the original GVAR-style baseline without NGC causal gates."""
     _validate_config(config)
@@ -228,15 +245,14 @@ def fit_gvar(
 
     num_vars = dataset.predictors.shape[-1]
     if model is None:
-        model = GSEVAR(
+        model = GVARModel(
             num_vars=num_vars,
             order=config.order,
             hidden_layer_size=config.hidden_layer_size,
             num_hidden_layers=config.num_hidden_layers,
-            use_causal_gate=False,
         )
-    elif model.causal_gate is not None:
-        raise ValueError("fit_gvar expects a model with use_causal_gate=False")
+    elif not isinstance(model, GVARModel):
+        raise ValueError("fit_gvar expects a GVARModel")
     model.to(device)
 
     optimizer = _make_optimizer(config, model)

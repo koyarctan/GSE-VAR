@@ -1,0 +1,54 @@
+\section{学習方法}
+\label{sec:learning}
+\subsection{予測損失と係数の平滑化}
+標本数\(N=T-K\)、全有効係数\(C_t\in\R^{K\times p\times p}\)として、
+\begin{align}
+ \mathcal L(\theta,\bm b,g)
+ &=\frac{1}{Np}\sum_{t=K+1}^{T}
+       \norm{\bm x_t-\widehat{\bm x}_t}_2^2
+   +\gamma\mathcal S(\theta,g),\label{eq:common-loss}\\
+ \mathcal S(\theta,g)
+ &=\frac{1}{(N-1)Kp^2}
+       \sum_{t=K+1}^{T-1}\norm{C_{t+1}-C_t}_F^2
+ \label{eq:smoothness}
+\end{align}
+とする。\(\theta\)は全係数生成器のパラメータである。第一項は1時点先の予測誤差、第二項はGVARでも用いられる時間平滑化項であり、\(\gamma\ge0\)をその強さとする\citep{marcinkevics2021}。
+
+\subsection{BernoulliゲートとDisARM}
+経路\(m=(k,i,j)\)ごとに独立な
+\begin{equation}
+ \pi_m=\sigma(\alpha_m),\qquad
+ z_m\sim\operatorname{Bernoulli}(\pi_m)
+ \label{eq:bernoulli}
+\end{equation}
+を用い、式\eqref{eq:gated-coefficients}の\(g\)を\(z\)に置き換える。\(\sigma\)はロジスティック関数、\(\alpha_m\)はロジットである。独立Bernoulli分布の積を\(q_\alpha\)と書き、学習目的を
+\begin{equation}
+ \mathcal J(\theta,\bm b,\alpha)
+ =\E_{z\sim q_\alpha}\!\left[\mathcal L(\theta,\bm b,z)\right]
+  +\lambda_0\sum_m\pi_m+\frac{\rho}{2}\norm{\theta}_2^2
+ \label{eq:binary-objective}
+\end{equation}
+とする。第二項はラグ別経路の期待選択数\(\E[\sum_m\ind\{z_m\ne0\}]\)への罰則であり、期待損失と選択経路数を釣り合わせる。最後の項は係数生成器の重み減衰であり、ロジットと切片は対象から除く。
+
+DisARM\citep{dong2020}では、共通乱数から得た二つのマスクの損失差で期待損失の勾配を推定する。成分ごとに独立な\(u_m\sim U(0,1)\)から
+\begin{equation}
+ z_m=\ind\{u_m<\pi_m\},\qquad
+ \widetilde z_m=\ind\{1-u_m<\pi_m\}
+ \label{eq:antithetic}
+\end{equation}
+を生成する。両者は同じ周辺分布を持ち、勾配推定に用いる各マスクは全時点で共有する。
+
+さらに、対象別に生成器を分離しているため、\(m=(k,i,j)\)の勾配には対象\(i\)の損失だけを用いられる。二乗誤差と時間平滑化の対象別成分を\(\ell_i\)とし、\(\sum_i\ell_i=\mathcal L\)となるよう正規化すると、推定勾配は
+\begin{align}
+ \widehat d_m={}&
+ \frac12\left[\ell_i(\theta,\bm b,z)-\ell_i(\theta,\bm b,\widetilde z)\right]
+ (1-2\widetilde z_m)\ind\{z_m\ne\widetilde z_m\}
+ \sigma(|\alpha_m|)\notag\\
+ &+\lambda_0\pi_m(1-\pi_m)
+ \label{eq:disarm}
+\end{align}
+となる。第一項で期待損失の勾配を推定し、第二項で期待L0罰則の解析的な微分を加える。ロジットにはこの勾配を、係数生成器と切片には二損失の平均の勾配を用い、Adamで同時に更新する。学習後は\(\widehat g_m=\ind\{\pi_m\ge0.5\}\)でゲートを固定することで、命題\ref{prop:noncausality}に基づいて非因果性を判定できる。
+
+
+
+VARXでも内生・外生両枝のマスク対を同じ更新前パラメータで評価し、両方のロジットと係数生成器を1回のAdam更新で学習する。内生・外生の期待L0罰則にはそれぞれ\(\lambda_Y,\lambda_X\)を用いる。
