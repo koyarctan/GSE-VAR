@@ -6,6 +6,7 @@
   `gvar/senn.py`, `epoch.py`, `linear_examples.py` were recovered from the previously stored, fixed-commit notebook source snapshots.
   Compatibility changes: prediction `.squeeze(-1)` retains the batch axis; random coefficient draws use `.item()` for NumPy's scalar-assignment rules. The sampling sequence is unchanged.
   The author's temporal-smoothness training calculation is retained, including its next-time input ordering and non-squared L2 norm. It is not relabelled as the paper's squared-norm formula.
+  `gvar/multiple_lotka_volterra.py` and `gvar/linvar.py` are unchanged copies from this same revision. They supply the RK4 predator–prey generator and the statsmodels VAR/F-test/BH baseline. Publication CSV and logged-grid hashes/values are recorded in `../lotka_volterra/source_manifest.json`.
 - NGC: Tank et al., *Neural Granger Causality*.
   https://arxiv.org/abs/1802.05842
   https://github.com/iancovert/Neural-GC/tree/c3263d40433aaf3acc94c27a0c1abf9b8e9fcedf

@@ -13,8 +13,19 @@ python -m pip install -e ".[experiments]"
 | Lorenz96 | `python -m experiments.lorenz96.run --mode full --device cuda:0` | `lorenz96/experiment.ipynb` | Independent pilot selection; F1 at the selected setting; PR/ROC regularization paths |
 | Linear VAR | `python -m experiments.linear_var.run --mode full --device cuda:0` | `linear_var/experiment.ipynb` | Independent pilot selection; positive/negative BA and their mean |
 | Favorita | `python -m experiments.favorita.run --device cuda:0` | `favorita/experiment.ipynb` | Minimum validation MSE; held-out MSE, MAE and selected routes |
+| Lotka–Volterra | `python -m experiments.lotka_volterra.run --devices cuda:0 cuda:1 cuda:2` | `lotka_volterra/experiment.ipynb` | Verified publication data; signed BA; independent pilot selection; full author GVAR grid |
 
 Synthetic experiments support `--mode smoke --device cpu` for pipeline verification with small data and few epochs. Smoke results are separate from full results. Notebooks require `TRAIN=True` to start fitting.
+
+## Remote sessions
+
+Run long remote experiments inside tmux. Activate the intended virtual environment and change to the repository root before starting the session. For example, Lorenz96 on an available GPU0:
+
+```bash
+tmux new-session -s lorenz96 -c "$PWD" "'$(command -v python)' -u -m experiments.lorenz96.run --mode full --device cuda:0; exec bash"
+```
+
+The absolute Python path preserves the selected virtual environment. Detach with `Ctrl+B`, then `D`; reconnect with `tmux attach -t lorenz96`. The experiment entry points and notebooks do not start tmux automatically. Select only GPUs available for the experiment. The Lotka–Volterra README provides its multi-GPU tmux command.
 
 ## Structure
 
@@ -23,6 +34,7 @@ Synthetic experiments support `--mode smoke --device cpu` for pipeline verificat
 - `lorenz96/`: the Lorenz96 protocol and its exact ten-candidate grids.
 - `linear_var/`: signed linear-VAR recovery.
 - `favorita/`: calendar alignment, training-only preprocessing and validation selection.
+- `lotka_volterra/`: multi-species predator–prey reproduction, a three-GPU work queue and a portable remote bundle; see its README for the two selection protocols.
 - `reference/`: fixed upstream source excerpts and licenses for data generation and baseline fitting.
 - `analyze.py`: read-only aggregation of completed runs.
 - `paper_figures.py`: figure generation from the saved publication archives.
